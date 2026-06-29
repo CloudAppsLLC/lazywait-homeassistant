@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "الاتصال بـ LazyWait",
+        "description": "أدخل رمز الإقران الظاهر في لوحة تحكم LazyWait ضمن التكاملات ← Home Assistant ← اتصال. الرمز صالح لمدة 10 دقائق تقريبًا.",
+        "data": {
+          "base_url": "رابط سحابة LazyWait",
+          "pairing_code": "رمز الإقران"
+        }
+      },
+      "reauth_confirm": {
+        "title": "إعادة الإقران مع LazyWait",
+        "description": "تمت إعادة تعيين اتصال LazyWait (تم تدوير الرمز أو إلغاؤه). افتح لوحة تحكم LazyWait، وأنشئ رمز إقران جديدًا، وأدخله هنا.",
+        "data": {
+          "base_url": "رابط سحابة LazyWait",
+          "pairing_code": "رمز إقران جديد"
+        }
+      }
+    },
+    "error": {
+      "code_invalid": "رمز الإقران غير صالح. تحقق منه وحاول مرة أخرى.",
+      "code_expired": "انتهت صلاحية رمز الإقران. أنشئ رمزًا جديدًا من لوحة تحكم LazyWait.",
+      "code_used": "تم استخدام رمز الإقران مسبقًا. أنشئ رمزًا جديدًا من لوحة تحكم LazyWait.",
+      "branch_mismatch": "هذا الرمز يقرن فرعًا مختلفًا. استخدم رمزًا أُنشئ لهذا الفرع.",
+      "cannot_connect": "تعذّر الوصول إلى LazyWait. تحقق من رابط السحابة واتصالك بالإنترنت."
+    },
+    "abort": {
+      "already_configured": "هذا الفرع في LazyWait متصل بالفعل بـ Home Assistant.",
+      "reauth_successful": "تمت إعادة الإقران مع LazyWait بنجاح."
+    }
+  }
+}

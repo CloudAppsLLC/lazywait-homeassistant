@@ -1,0 +1,11 @@
+{
+  "domain": "lazywait",
+  "name": "LazyWait",
+  "codeowners": ["@lazywait"],
+  "config_flow": true,
+  "documentation": "https://lazywait.com/integrations/home-assistant",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/CloudAppsLLC/lazywait-homeassistant/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}

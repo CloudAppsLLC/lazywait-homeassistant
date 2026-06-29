@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to LazyWait",
+        "description": "Enter the pairing code shown in your LazyWait dashboard under Integrations → Home Assistant → Connect. The code is valid for about 10 minutes.",
+        "data": {
+          "base_url": "LazyWait cloud URL",
+          "pairing_code": "Pairing code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-pair with LazyWait",
+        "description": "Your LazyWait connection was reset (the token was rotated or revoked). Open the LazyWait dashboard, generate a new pairing code, and enter it here.",
+        "data": {
+          "base_url": "LazyWait cloud URL",
+          "pairing_code": "New pairing code"
+        }
+      }
+    },
+    "error": {
+      "code_invalid": "That pairing code is not valid. Check it and try again.",
+      "code_expired": "That pairing code has expired. Generate a new one in the LazyWait dashboard.",
+      "code_used": "That pairing code has already been used. Generate a new one in the LazyWait dashboard.",
+      "branch_mismatch": "That code pairs a different branch. Use a code generated for this branch.",
+      "cannot_connect": "Could not reach LazyWait. Check the cloud URL and your internet connection."
+    },
+    "abort": {
+      "already_configured": "This LazyWait branch is already connected to Home Assistant.",
+      "reauth_successful": "Re-paired with LazyWait successfully."
+    }
+  }
+}
