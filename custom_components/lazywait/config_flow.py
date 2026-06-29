@@ -25,8 +25,20 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+# ConfigFlowResult was added in HA 2024.4; older cores have FlowResult instead.
+# Import whichever exists so the module loads across HA versions (a hard import
+# of a missing name makes the whole config flow fail to load -> a 500 when the
+# user opens the integration). We only use it as a return-type annotation.
+try:  # HA >= 2024.4
+    from homeassistant.config_entries import ConfigFlowResult
+except ImportError:  # older HA
+    try:
+        from homeassistant.data_entry_flow import FlowResult as ConfigFlowResult
+    except ImportError:  # extremely old fallback — annotation only
+        ConfigFlowResult = Any  # type: ignore[assignment,misc]
 
 from .api import (
     LazyWaitApiClient,
@@ -60,8 +72,10 @@ class LazyWaitConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    def __init__(self) -> None:
-        self._reauth_entry_id: str | None = None
+    # NOTE: do NOT define __init__ to set self._reauth_entry_id — newer HA's
+    # ConfigFlow base class exposes that as a read-only property, so assigning it
+    # raises "AttributeError: ... has no setter" and the flow 500s on open. We
+    # read the entry id from self.context (which HA populates on reauth) instead.
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -112,7 +126,6 @@ class LazyWaitConfigFlow(ConfigFlow, domain=DOMAIN):
         self, entry_data: dict[str, Any]
     ) -> ConfigFlowResult:
         """Entry point when a stored token is rejected (rotated/revoked)."""
-        self._reauth_entry_id = self.context.get("entry_id")
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
@@ -120,9 +133,12 @@ class LazyWaitConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Re-prompt for a fresh pairing code and replace the stored token."""
         errors: dict[str, str] = {}
+        # HA puts the entry id on the reauth context; read it from there rather
+        # than a custom instance attribute.
+        reauth_entry_id = self.context.get("entry_id")
         entry = (
-            self.hass.config_entries.async_get_entry(self._reauth_entry_id)
-            if self._reauth_entry_id
+            self.hass.config_entries.async_get_entry(reauth_entry_id)
+            if reauth_entry_id
             else None
         )
         base_url_default = (
