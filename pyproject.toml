@@ -1,0 +1,17 @@
+[project]
+name = "lazywait-homeassistant"
+version = "1.0.0"
+description = "LazyWait Home Assistant integration"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "aiohttp",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
