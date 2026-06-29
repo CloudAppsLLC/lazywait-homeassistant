@@ -1,0 +1,31 @@
+name: Validate
+
+# Runs the two checks every Home Assistant custom integration is expected to
+# pass before it can be listed in HACS:
+#   - hassfest: Home Assistant's own manifest/integration validator.
+#   - HACS:     validates the repo structure (hacs.json, README, etc.).
+# Both run on push, PRs, and a weekly schedule (HACS recommends the schedule so
+# upstream rule changes are caught even without new commits).
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 0 * * 0"
+
+jobs:
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
