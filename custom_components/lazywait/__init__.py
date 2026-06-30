@@ -8,6 +8,7 @@ heartbeats. A rejected token surfaces as a reauth flow.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -19,6 +20,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import LazyWaitApiClient, LazyWaitApiError, LazyWaitAuthError
 from .const import CONF_BASE_URL, CONF_BRANCH_ID, CONF_TOKEN, DOMAIN
 from .coordinator import LazyWaitCoordinator
+from .ws_client import LazyWaitAdminSocket
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +49,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = LazyWaitCoordinator(hass, client, branch_id)
     await coordinator.async_config_entry_first_refresh()
 
+    # Start the persistent admin-control WebSocket (near-instant device/
+    # automation control from the cloud dashboard). It's a long-lived task that
+    # reconnects on its own; the coordinator's 30s poll is the degraded fallback
+    # when the socket is down. Stashed ON the coordinator (not the data dict) so
+    # the existing platform reads of hass.data[DOMAIN][entry_id] — which expect
+    # the coordinator directly — keep working. Cancelled cleanly on unload.
+    admin_socket = LazyWaitAdminSocket(hass, entry, client, branch_id)
+    admin_task = hass.loop.create_task(admin_socket.run())
+    coordinator.attach_admin_socket(admin_socket, admin_task)
+
+    # Store the coordinator directly (unchanged contract for sensor /
+    # binary_sensor / hikvision platforms).
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -56,5 +70,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if coordinator is not None:
+            await coordinator.shutdown_admin_socket()
     return unloaded

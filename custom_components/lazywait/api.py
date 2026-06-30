@@ -208,6 +208,60 @@ class LazyWaitApiClient:
         url = self._url("/camera/cameras")
         return await self._authed_request("POST", url, json={"cameras": cameras})
 
+    # ── Admin control (persistent WS + HTTP-poll fallback) ──────────────────
+
+    def ws_url(self, admin_ws_path: str) -> str:
+        """The admin control WebSocket URL: the ws/wss form of the base URL.
+
+        http://…  → ws://…   ;  https://… → wss://…  . The path is appended to
+        the base (which already includes the /v1 prefix), so a white-label host
+        that terminates TLS works without extra config.
+        """
+        base = self._base_url
+        if base.startswith("https://"):
+            ws_base = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            ws_base = "ws://" + base[len("http://"):]
+        else:
+            ws_base = base
+        return f"{ws_base}{admin_ws_path}"
+
+    def auth_headers(self) -> dict[str, str]:
+        """Public accessor for the bearer headers (the WS client needs them on
+        the upgrade handshake). Raises LazyWaitAuthError when unpaired."""
+        return self._auth_headers()
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        """The shared aiohttp session (reused for the WS connect)."""
+        return self._session
+
+    async def poll_commands(self) -> dict[str, Any]:
+        """HTTP fallback: claim the next queued admin command for this branch.
+
+        GET /integrations/home-assistant/admin/commands/poll (bearer-authed).
+        Used ONLY when the persistent control WebSocket is down. Returns the
+        cloud's response verbatim:
+          { "pending": false }
+          { "pending": true, "command": { commandId, kind, domain, service, … } }
+
+        Raises LazyWaitAuthError on 401 (token rotated); LazyWaitApiError else.
+        """
+        url = self._url("/admin/commands/poll")
+        return await self._authed_request("GET", url)
+
+    async def post_command_result(
+        self, command_id: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """HTTP fallback: post a command's result.
+
+        POST /integrations/home-assistant/admin/commands/<id>/result. `result`
+        is { status: 'ok'|'error', errorKey?, result? }. Returns { ok: true } or
+        a 404 when the command expired.
+        """
+        url = self._url(f"/admin/commands/{command_id}/result")
+        return await self._authed_request("POST", url, json=result)
+
     # ── Face attendance (Hikvision) ─────────────────────────────────────────
 
     async def face_checkin(
