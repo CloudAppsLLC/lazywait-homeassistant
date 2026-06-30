@@ -12,6 +12,8 @@ https://apiv2.lazywait.com/v1):
   POST /integrations/home-assistant/events    — push a batch of events
   GET  /integrations/home-assistant/ping       — liveness / token check
   POST /integrations/home-assistant/status     — self-reported health heartbeat
+  GET  /integrations/home-assistant/camera/poll   — claim a pending WebRTC offer
+  POST /integrations/home-assistant/camera/answer — return the SDP answer
 """
 
 from __future__ import annotations
@@ -146,6 +148,46 @@ class LazyWaitApiClient:
             "configVersion": config_version,
             "lastEventAt": last_event_at,
         }
+        return await self._authed_request("POST", url, json=body)
+
+    # ── Live camera WebRTC signaling ────────────────────────────────────────
+
+    async def camera_poll(self) -> dict[str, Any]:
+        """Poll the cloud for a pending WebRTC offer for this branch.
+
+        GET /integrations/home-assistant/camera/poll (bearer-authed; the cloud
+        resolves the branch from the token, never from us).
+
+        Returns the cloud's response verbatim:
+          { "pending": false }
+          { "pending": true, "sessionId": str, "offer": <sdp>, "cameraId": str }
+
+        The dashboard posts an SDP offer for a branch camera; the cloud holds it
+        for ~60s and hands it to whichever HA loop polls first. `offer` is a full
+        SDP with ICE candidates bundled non-trickle. `cameraId` identifies which
+        go2rtc stream / HA camera entity to answer with (may be ""→ default).
+
+        Raises LazyWaitAuthError on 401 (token rotated) so the coordinator can
+        surface reauth; LazyWaitApiError on other failures.
+        """
+        url = self._url("/camera/poll")
+        return await self._authed_request("GET", url)
+
+    async def camera_answer(
+        self, session_id: str, answer_sdp: str
+    ) -> dict[str, Any]:
+        """Post HA/go2rtc's SDP answer for a signaling session.
+
+        POST /integrations/home-assistant/camera/answer (bearer-authed). The
+        branch is resolved cloud-side from the token; we only send the session id
+        and the SDP answer (ICE bundled non-trickle).
+
+        Returns { "ok": true } on success. A 404
+        { "errorKey": "HA_CAMERA_SESSION_NOT_FOUND" } means the session expired
+        (the dashboard waited too long) — the caller logs + drops.
+        """
+        url = self._url("/camera/answer")
+        body = {"sessionId": session_id, "answer": answer_sdp}
         return await self._authed_request("POST", url, json=body)
 
     # ── Face attendance (Hikvision) ─────────────────────────────────────────

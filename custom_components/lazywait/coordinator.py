@@ -28,6 +28,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import LazyWaitApiClient, LazyWaitApiError, LazyWaitAuthError
+from .camera import Go2RtcTarget, answer_offer
 from .const import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DOMAIN,
@@ -46,7 +47,12 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Owns the cloud poll/push loop for one branch."""
 
     def __init__(
-        self, hass: HomeAssistant, client: LazyWaitApiClient, branch_id: str
+        self,
+        hass: HomeAssistant,
+        client: LazyWaitApiClient,
+        branch_id: str,
+        go2rtc_target: Go2RtcTarget | None = None,
+        default_stream_id: str = "",
     ) -> None:
         super().__init__(
             hass,
@@ -62,6 +68,10 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Monotonic counter → a stable Idempotency-Key per flush attempt so a
         # retried flush of the same batch is recognized cloud-side.
         self._flush_seq = 0
+        # Live-camera signaling: where the local go2rtc is + the default stream
+        # to answer with when the cloud offer carries no explicit cameraId.
+        self._go2rtc_target = go2rtc_target or Go2RtcTarget()
+        self._default_stream_id = default_stream_id
 
     @property
     def branch_id(self) -> str:
@@ -111,12 +121,80 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 config_version=self._config_version,
                 last_event_at=self._last_event_at,
             )
+
+            # Best-effort: service any pending live-camera WebRTC offer. This is
+            # isolated so a signaling hiccup never fails the main poll cycle.
+            await self._pump_camera_signaling()
+
             return config
         except LazyWaitAuthError as err:
             # Token rotated/revoked → HA opens the reauth flow.
             raise ConfigEntryAuthFailed(str(err)) from err
         except LazyWaitApiError as err:
             raise UpdateFailed(f"LazyWait cloud poll failed: {err}") from err
+
+    async def _pump_camera_signaling(self) -> None:
+        """Service one pending live-camera WebRTC offer, if any.
+
+        Polls the cloud for a pending SDP offer for this branch; when present,
+        asks the local go2rtc to produce an answer and posts it back. This is
+        SIGNALING ONLY — the resulting media flows peer-to-peer (dashboard <->
+        go2rtc) over Twilio TURN and never traverses HA's poll path.
+
+        Strictly best-effort: any failure is logged and swallowed so the camera
+        path can never break the main coordinator cycle. A LazyWaitAuthError is
+        the one exception we re-raise — a dead token must surface as reauth, and
+        it would have already failed the config/heartbeat calls above anyway.
+        """
+        try:
+            pending = await self._client.camera_poll()
+        except LazyWaitAuthError:
+            raise
+        except LazyWaitApiError as err:
+            _LOGGER.debug("camera poll failed (ignored): %s", err)
+            return
+        except Exception as err:  # noqa: BLE001 - never break the loop
+            _LOGGER.debug("camera poll errored (ignored): %s", err)
+            return
+
+        if not isinstance(pending, dict) or not pending.get("pending"):
+            return
+
+        session_id = pending.get("sessionId")
+        offer_sdp = pending.get("offer")
+        camera_id = pending.get("cameraId") or ""
+        if not session_id or not offer_sdp:
+            _LOGGER.debug("camera poll returned a malformed pending offer; skipping")
+            return
+
+        # Reuse the API client's aiohttp session for the local go2rtc call.
+        session = self._client._session  # noqa: SLF001 - same package reuse
+
+        result = await answer_offer(
+            session,
+            self._go2rtc_target,
+            camera_id=camera_id,
+            offer_sdp=offer_sdp,
+            default_stream_id=self._default_stream_id,
+        )
+
+        if not result.ok or not result.answer_sdp:
+            _LOGGER.warning(
+                "Live camera: go2rtc produced no answer for session %s (%s)",
+                session_id,
+                (result.fallback or {}).get("reason") if result.fallback else "unknown",
+            )
+            return
+
+        try:
+            await self._client.camera_answer(session_id, result.answer_sdp)
+            _LOGGER.info("Live camera: answered session %s", session_id)
+        except LazyWaitAuthError:
+            raise
+        except LazyWaitApiError as err:
+            _LOGGER.debug("camera answer post failed (ignored): %s", err)
+        except Exception as err:  # noqa: BLE001 - never break the loop
+            _LOGGER.debug("camera answer post errored (ignored): %s", err)
 
     async def _flush_events(self) -> None:
         """Drain the buffer to the cloud; re-buffer on failure for next cycle."""

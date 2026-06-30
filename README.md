@@ -190,6 +190,48 @@ replaced.
 
 ---
 
+## Live camera view
+
+The dashboard can open a **live WebRTC view** of a branch camera, streamed
+straight from the camera to the browser — the LazyWait cloud only relays the
+handshake, never the video.
+
+**How it works (WebRTC, NAT-friendly):**
+
+1. In the dashboard, an admin opens a branch camera. The browser creates a
+   WebRTC **offer** (an SDP blob with its ICE candidates bundled in) and POSTs
+   it to the cloud, which returns a `sessionId` and **Twilio TURN** credentials
+   (the same TURN service screen-share uses — reused for NAT traversal).
+2. Home Assistant is **outbound-only** behind NAT, so it can't accept an inbound
+   connection. Instead, on each poll cycle the integration **polls** the cloud
+   for a pending offer for its branch.
+3. When an offer is pending, HA asks its **bundled go2rtc** to produce an
+   **answer** for that offer against the requested camera stream, and POSTs the
+   answer back to the cloud.
+4. The dashboard polls for the answer, applies it, and the browser and go2rtc
+   connect **peer-to-peer** over Twilio TURN. **Video never touches the cloud** —
+   only the SDP offer/answer does.
+
+**What you need:**
+
+- go2rtc is bundled in modern Home Assistant. Your camera must be published as a
+  go2rtc stream (HA registers `camera.*` entities with go2rtc automatically; you
+  can also name streams in `go2rtc.yaml`). The dashboard's `cameraId` maps to the
+  go2rtc `src` stream name (empty → the integration's default stream).
+- No inbound port-forwarding. HA stays outbound-only; the cloud is the rendezvous
+  for signaling and Twilio handles media relay.
+
+**go2rtc handshake note:** the integration tries the standalone go2rtc API
+(`POST http://127.0.0.1:1984/api/webrtc?src=<stream>`) and the HA-proxied form
+(`POST /api/go2rtc/webrtc?src=<stream>`), using the first that returns an SDP
+answer. The exact go2rtc WebRTC route varies between go2rtc releases — if neither
+answers, the integration logs **"go2rtc handshake unconfirmed"** with what it
+tried, and the stream falls back gracefully rather than failing the poll loop.
+See `custom_components/lazywait/camera.py` for the one call to verify against your
+HA build's go2rtc.
+
+---
+
 ## Cloud endpoints used (reference)
 
 All under the configured base URL + `/integrations/home-assistant`:
@@ -201,6 +243,8 @@ All under the configured base URL + `/integrations/home-assistant`:
 | POST | `/events` | bearer | push a batch of events (Idempotency-Key) |
 | GET | `/ping` | bearer | liveness + token check |
 | POST | `/status` | bearer | self-reported health heartbeat |
+| GET | `/camera/poll` | bearer | claim a pending live-camera WebRTC offer |
+| POST | `/camera/answer` | bearer | return the SDP answer for a session |
 
 The bearer is the token minted by `/pair`. The cloud resolves your branch from
 the token — Home Assistant never sends the branch id in a request body.
