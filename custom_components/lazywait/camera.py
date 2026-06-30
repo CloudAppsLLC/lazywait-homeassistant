@@ -229,6 +229,32 @@ async def _answer_via_ha_native(
         _LOGGER.debug("camera %s has no STREAM feature; native WebRTC skipped", entity_id)
         return None
 
+    # Prime the camera's WebRTC provider exactly like the frontend does before it
+    # sends an offer: request the client configuration. On some HA builds the
+    # provider session/state is established lazily by THIS call, and without it
+    # the offer handler can no-op (send_message never fires → we see "no answer").
+    # Harmless when the method is absent or the provider needs no priming.
+    try:
+        get_cfg = getattr(camera, "async_get_webrtc_client_configuration", None) or getattr(
+            camera, "async_request_webrtc_client_configuration", None
+        )
+        if callable(get_cfg):
+            cfg = await get_cfg()
+            _LOGGER.debug("HA WebRTC client config for %s: %s", entity_id, cfg)
+    except Exception as err:  # noqa: BLE001 - priming is best-effort
+        _LOGGER.debug("WebRTC client-config prime for %s failed (continuing): %s", entity_id, err)
+
+    # Log what the camera actually advertises so a "no answer" is diagnosable from
+    # the HA log (WARNING, not debug). frontend_stream_type tells us whether HA
+    # will answer WebRTC natively or route via go2rtc.
+    _LOGGER.warning(
+        "Native WebRTC attempt for %s: has_async_handler=%s stream_type=%s features=%s",
+        entity_id,
+        callable(getattr(camera, "async_handle_async_webrtc_offer", None)),
+        getattr(camera, "frontend_stream_type", "?"),
+        getattr(camera, "supported_features", "?"),
+    )
+
     # Preferred: the unified async provider API (HA 2024.11+ through 2026.6.x).
     handle_async = getattr(camera, "async_handle_async_webrtc_offer", None)
     if callable(handle_async):
@@ -250,11 +276,16 @@ async def _answer_via_ha_native(
                 # ignored here.
                 if answer_future.done():
                     return
+                _LOGGER.debug(
+                    "HA native WebRTC message for %s: %s", entity_id, type(message).__name__
+                )
                 if isinstance(message, WebRTCAnswer):
                     answer_future.set_result(message.sdp)
                 elif isinstance(message, WebRTCError):
-                    _LOGGER.debug(
-                        "HA native WebRTC error for %s: %s/%s",
+                    # WARNING so the real provider error (e.g. no provider, go2rtc
+                    # unreachable, codec mismatch) is visible in the HA log.
+                    _LOGGER.warning(
+                        "HA native WebRTC error for %s: %s / %s",
                         entity_id,
                         getattr(message, "code", "?"),
                         getattr(message, "message", "?"),
@@ -274,10 +305,22 @@ async def _answer_via_ha_native(
                     )
                 return answer
             except (asyncio.TimeoutError, asyncio.CancelledError) as err:
-                _LOGGER.debug("HA native WebRTC offer timed out for %s: %s", entity_id, err)
+                _LOGGER.warning(
+                    "HA native WebRTC offer TIMED OUT for %s after %ss (send_message never "
+                    "delivered an answer) — the provider accepted the offer but produced no "
+                    "answer: %s",
+                    entity_id,
+                    _HANDSHAKE_TIMEOUT_SECONDS,
+                    err,
+                )
                 return None
             except Exception as err:  # noqa: BLE001 - any provider error → fallback
-                _LOGGER.debug("HA native WebRTC offer failed for %s: %s", entity_id, err)
+                _LOGGER.warning(
+                    "HA native WebRTC offer FAILED for %s: %s: %s",
+                    entity_id,
+                    type(err).__name__,
+                    err,
+                )
                 return None
             finally:
                 # Best-effort teardown so the provider doesn't hold the session open.
