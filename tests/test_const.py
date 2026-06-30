@@ -42,7 +42,12 @@ def test_default_poll_interval_seconds() -> None:
 
 
 def test_integration_version() -> None:
-    assert INTEGRATION_VERSION == "1.0.2"
+    # Version is unified CalVer (YY.M.seq) and bumped every release by the
+    # print-server version-bump script, so assert the FORMAT, not a pinned value
+    # (a hardcoded version breaks the test on every bump).
+    import re
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", INTEGRATION_VERSION), INTEGRATION_VERSION
 
 
 def test_event_types() -> None:
