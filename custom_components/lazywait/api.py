@@ -148,6 +148,47 @@ class LazyWaitApiClient:
         }
         return await self._authed_request("POST", url, json=body)
 
+    # ── Face attendance (Hikvision) ─────────────────────────────────────────
+
+    async def face_checkin(
+        self, photo_base64: str, branch_id: str | None = None
+    ) -> dict[str, Any]:
+        """Forward a detected face to the cloud face-checkin endpoint.
+
+        POSTs to {base_url}/hrm/attendance/face-checkin (NOTE: this lives
+        OUTSIDE the /integrations/home-assistant prefix — it's the shared,
+        device-facing HRMS route). The cloud runs AWS Rekognition, toggles the
+        matched employee's clock IN/OUT, and writes an hrms_attendance row with
+        a 5-min per-employee cooldown.
+
+        This route is PUBLIC (device-facing, no JWT) — the body is the only
+        input it needs. We still attach the bearer when we have one (harmless;
+        the route ignores it), so a future move to an authenticated variant is a
+        one-line change. `branch_id` defaults to the entry's paired branch so a
+        camera check-in is attributed to the right store.
+
+        Returns the cloud's response verbatim:
+          { matched, employeeId?, employeeName?, clientId?, similarity?,
+            action?: 'clock_in' | 'clock_out', recorded, reason?, attendance? }
+
+        Raises LazyWaitApiError on a non-2xx (the caller logs + drops — a missed
+        camera frame is not worth failing the whole automation over).
+        """
+        # /hrm/... hangs directly off the base URL, not the HA prefix.
+        url = f"{self._base_url}/hrm/attendance/face-checkin"
+        body: dict[str, Any] = {
+            "photo_base64": photo_base64,
+            "source": "hikvision",
+        }
+        if branch_id:
+            body["branch_id"] = branch_id
+        # Bearer is optional here; send it only if paired. No _auth_headers()
+        # call (that raises when unpaired) — face-checkin must work token-less.
+        headers = (
+            {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        )
+        return await self._authed_request("POST", url, json=body, headers=headers)
+
     # ── internals ───────────────────────────────────────────────────────────
 
     async def _authed_request(

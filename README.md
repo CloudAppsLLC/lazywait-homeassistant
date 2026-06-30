@@ -91,6 +91,95 @@ Event shape pushed to the cloud:
 
 ---
 
+## Face attendance (Hikvision)
+
+A **Hikvision** camera at the entrance can clock employees **in/out by face** —
+no badge, no app. When the camera sees a face, Home Assistant grabs a still and
+forwards it to LazyWait, which recognises the employee (AWS Rekognition), toggles
+their clock **IN → OUT → IN**, and writes an attendance row. A built-in **5-minute
+per-employee cooldown** stops a person lingering in frame from double-punching.
+
+These camera check-ins show up on the dashboard attendance monitor like any other
+row — they're tagged `location_in.address = "hikvision:<branch_id>"` and have a
+**null** `created_by_user_id` (that's how the dashboard tells a face check-in from
+a manual one).
+
+### 1. Add the camera to Home Assistant
+
+Add your Hikvision camera in HA the normal way (the built-in **Generic Camera** or
+the **ONVIF** integration, pointed at the camera's snapshot/RTSP URL). You'll need
+an ISAPI user on the camera with preview/picture rights.
+
+The still LazyWait uses is the standard ISAPI snapshot:
+
+```
+http://<user>:<pass>@<camera-host>/ISAPI/Streaming/channels/101/picture
+```
+
+`101` is channel 1, main stream (on an NVR it's `<channel>01`). Confirm it returns
+a JPEG in a browser before wiring the automation.
+
+### 2. Trigger on a face/person detection
+
+Point an automation at the camera's own detection event so a face is actually in
+frame when the snapshot is taken. Either:
+
+- **On-device smart event** — Hikvision face/line/VMD events surfaced via the
+  ONVIF or Hikvision integration as a `binary_sensor` (preferred — fires only when
+  a person is seen), or
+- **Motion** at the entrance as a simpler fallback.
+
+When that trigger fires, call the bridge with the camera's host + ISAPI
+credentials. The component captures the snapshot and posts it to LazyWait:
+
+```yaml
+# Example: clock employees in/out when the entrance camera detects a face.
+automation:
+  - alias: "LazyWait face check-in (entrance)"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.entrance_cam_face_detection
+        to: "on"
+    action:
+      - service: python_script.lazywait_face_checkin   # thin wrapper, see below
+        data:
+          host: "192.168.1.64"
+          username: "attendance"
+          password: !secret hikvision_attendance_pw
+```
+
+Under the hood the bridge runs:
+
+```python
+from custom_components.lazywait.hikvision import async_handle_face_event
+
+# entry = the paired LazyWait config entry; branch is read from it automatically.
+await async_handle_face_event(
+    hass, entry,
+    host="192.168.1.64", username="attendance", password="…",
+)
+# → captures the snapshot, base64-encodes it, and POSTs to
+#   {base_url}/hrm/attendance/face-checkin with source="hikvision".
+```
+
+`async_handle_face_event` also accepts a pre-captured `image_base64=` if your
+automation already has the frame (e.g. from an HA camera entity or a smart-event
+payload) — in that case no snapshot is taken.
+
+### What comes back
+
+The cloud returns `{ matched, employeeName?, action: "clock_in" | "clock_out",
+recorded, reason?, attendance? }`. A missed/blurred frame or an unrecognised face
+simply returns `matched: false` and is dropped — the next detection tries again.
+Nothing the camera does can break the automation or the cloud link.
+
+> **Preferred future path:** Hikvision can stream the *exact cropped face* over
+> `/ISAPI/Event/notification/alertStream` (its smart-event channel), avoiding the
+> "whoever's in frame" snapshot. That's documented in `hikvision.py` as the next
+> upgrade; the snapshot path ships today because it works on every model.
+
+---
+
 ## Re-pairing (token rotated or revoked)
 
 If an admin clicks **Rotate** or **Disconnect** in the dashboard, the stored
@@ -115,3 +204,15 @@ All under the configured base URL + `/integrations/home-assistant`:
 
 The bearer is the token minted by `/pair`. The cloud resolves your branch from
 the token — Home Assistant never sends the branch id in a request body.
+
+One more endpoint lives **outside** the `/integrations/home-assistant` prefix —
+the shared, device-facing face-attendance route:
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| POST | `/hrm/attendance/face-checkin` | none (public) | recognise a face → clock in/out |
+
+Body: `{ photo_base64, branch_id?, source: "hikvision" }`. It's public because
+cameras/devices hit it directly; Home Assistant still attaches its bearer (the
+route ignores it). Attendance rows it writes are read back by the dashboard via
+`GET /hrm/attendance`.
