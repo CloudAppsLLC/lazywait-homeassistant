@@ -1,12 +1,14 @@
 {
   "domain": "lazywait",
   "name": "LazyWait",
-  "codeowners": ["@CloudAppsLLC"],
+  "codeowners": [
+    "@CloudAppsLLC"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/CloudAppsLLC/lazywait-homeassistant",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/CloudAppsLLC/lazywait-homeassistant/issues",
   "requirements": [],
-  "version": "1.0.2"
+  "version": "26.6.1"
 }
