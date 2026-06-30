@@ -213,20 +213,30 @@ handshake, never the video.
    only the SDP offer/answer does.
 
 **Cameras are auto-discovered.** You don't list them anywhere. On each poll cycle
-(throttled to ~once every 30s) the integration enumerates the local go2rtc
-streams (`GET /api/streams`, falling back to HA `camera.*` entities) and **reports
-the list outbound** to the cloud, which caches it and serves it to the dashboard
-picker. Each camera is `{ id, name, online }` where `id` is the go2rtc stream
-`src` — the dashboard hands that `id` straight back as `cameraId` when it opens a
-stream. Discovery is best-effort: if go2rtc isn't reachable, the list is simply
-empty and the live view degrades gracefully.
+(throttled to ~once every 30s) the integration discovers cameras two ways and
+merges them: (1) the local go2rtc streams (`GET /api/streams`), and (2) every HA
+`camera.*` entity read **directly from the in-process Home Assistant state
+machine** — no token, no HTTP. The combined list is **reported outbound** to the
+cloud, which caches it and serves it to the dashboard picker. Each camera is
+`{ id, name, online }` where `id` is the `camera.*` entity_id (which HA also
+registers with go2rtc as the stream `src`) — the dashboard hands that `id`
+straight back as `cameraId` when it opens a stream. Discovery is best-effort: if
+both sources come up empty the live view degrades gracefully.
+
+**Hikvision / NVR channels work out of the box.** NVR channel cameras are *not*
+auto-published as go2rtc streams, so the go2rtc list alone misses them. The
+in-process `camera.*` enumeration picks them up automatically — **no `go2rtc.yaml`
+entry is required**. Just add the camera/NVR channels to HA as `camera.*` entities
+(Generic Camera / ONVIF) and they appear in the dashboard picker on the next poll.
 
 **What you need:**
 
-- go2rtc is bundled in modern Home Assistant. Your camera must be published as a
-  go2rtc stream (HA registers `camera.*` entities with go2rtc automatically; you
-  can also name streams in `go2rtc.yaml`). The dashboard's `cameraId` maps to the
-  go2rtc `src` stream name (empty → the integration's default stream).
+- Add your cameras to HA as `camera.*` entities — that alone is enough for them to
+  be discovered and appear in the picker (Hikvision NVR channels included).
+- go2rtc is bundled in modern Home Assistant; HA registers `camera.*` entities
+  with go2rtc automatically. You can optionally name streams in `go2rtc.yaml`. The
+  dashboard's `cameraId` maps to the go2rtc `src` stream name (empty → the
+  integration's default stream).
 - No inbound port-forwarding. HA stays outbound-only; the cloud is the rendezvous
   for signaling and Twilio handles media relay.
 

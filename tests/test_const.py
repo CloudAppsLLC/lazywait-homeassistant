@@ -42,7 +42,7 @@ def test_default_poll_interval_seconds() -> None:
 
 
 def test_integration_version() -> None:
-    assert INTEGRATION_VERSION == "1.0.0"
+    assert INTEGRATION_VERSION == "1.0.2"
 
 
 def test_event_types() -> None:

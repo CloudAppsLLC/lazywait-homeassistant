@@ -357,19 +357,82 @@ async def _list_from_ha_entities(
     return cameras
 
 
+def list_from_hass_states(hass: Any) -> list[dict[str, Any]]:
+    """Discover ``camera.*`` entities directly from the in-process HA object.
+
+    This is the RELIABLE discovery path for Hikvision/NVR channels and any other
+    HA camera that is NOT auto-registered as a go2rtc stream: it reads HA's state
+    machine synchronously, in-process — no HTTP, no long-lived token. HA registers
+    each of its camera entities with the bundled go2rtc under the entity id, so
+    the ``camera.*`` entity_id doubles as the go2rtc ``src`` and flows straight
+    back as ``cameraId`` into ``answer_offer`` (which already resolves
+    ``cameraId`` → ``src``).
+
+    Maps each camera State to ``{ id, name, online }`` where:
+      * id     = the ``camera.*`` entity_id,
+      * name   = the ``friendly_name`` attribute, falling back to the entity_id,
+      * online = the state is not ``unavailable`` / ``unknown``.
+
+    Uses the stable public API ``hass.states.async_all('camera')`` (the domain
+    filter is supported across current HA core versions; we still guard the
+    per-state shape defensively). Best-effort and NEVER raises — returns ``[]``
+    when ``hass`` is missing or the state machine can't be read, so the
+    coordinator's report step can't break the poll loop.
+    """
+    if hass is None:
+        return []
+    try:
+        states = hass.states.async_all("camera")
+    except Exception as err:  # noqa: BLE001 - discovery must never raise
+        _LOGGER.debug("hass.states camera enumeration failed (ignored): %s", err)
+        return []
+
+    cameras: list[dict[str, Any]] = []
+    for state in states or []:
+        entity_id = getattr(state, "entity_id", None)
+        if not isinstance(entity_id, str) or not entity_id.startswith("camera."):
+            continue
+        attrs = getattr(state, "attributes", None)
+        friendly = (
+            attrs.get("friendly_name")
+            if hasattr(attrs, "get")
+            and isinstance(attrs.get("friendly_name"), str)
+            else None
+        )
+        state_val = getattr(state, "state", None)
+        # "unavailable"/"unknown" → offline; anything else (idle/recording/
+        # streaming) means the entity is reachable.
+        online = state_val not in ("unavailable", "unknown")
+        cameras.append(
+            {
+                "id": entity_id,
+                "name": (friendly or entity_id).strip() or entity_id,
+                "online": bool(online),
+            }
+        )
+    return cameras
+
+
 async def list_cameras(
-    session: aiohttp.ClientSession, target: Go2RtcTarget
+    session: aiohttp.ClientSession,
+    target: Go2RtcTarget,
+    hass: Any = None,
 ) -> list[dict[str, Any]]:
     """Discover the branch's cameras for the cloud/dashboard picker.
 
     Returns ``[{ "id": str, "name": str, "online": bool }]`` where ``id`` is the
     go2rtc stream ``src`` (opaque to the cloud; fed straight back as ``cameraId``
-    into the offer flow). Strategy:
+    into the offer flow). Strategy, merged + deduped by id in this order:
 
-      1. Enumerate go2rtc streams (``/api/streams``) — the authoritative list,
-         tried standalone then HA-proxied (see ``_build_streams_attempts``).
-      2. If that yields nothing, fall back to HA ``camera.*`` entities via the HA
-         REST API and merge/dedupe by id.
+      1. Enumerate go2rtc streams (``/api/streams``) — for branches that DO use a
+         go2rtc.yaml, tried standalone then HA-proxied (see
+         ``_build_streams_attempts``).
+      2. Enumerate HA ``camera.*`` entities directly from the in-process ``hass``
+         object (``list_from_hass_states``) — the reliable path that surfaces
+         Hikvision/NVR channels which never auto-register with go2rtc. No token,
+         no HTTP.
+      3. Last resort ONLY when ``hass`` is unavailable: HA ``camera.*`` entities
+         via the HA REST API (needs a long-lived token; usually a no-op).
 
     Best-effort and NEVER raises — returns ``[]`` on total failure so the
     coordinator's report step can't break the poll loop.
@@ -377,6 +440,7 @@ async def list_cameras(
     timeout = aiohttp.ClientTimeout(total=_HANDSHAKE_TIMEOUT_SECONDS)
     cameras: list[dict[str, Any]] = []
 
+    # 1) go2rtc streams (authoritative for go2rtc.yaml-configured branches).
     for attempt in _build_streams_attempts(target):
         url = attempt["url"]
         headers = attempt["headers"]
@@ -393,8 +457,17 @@ async def list_cameras(
             cameras = parsed
             break
 
-    # Secondary source: HA camera entities, only when go2rtc gave us nothing.
-    if not cameras:
+    # 2) In-process HA camera entities — the reliable path (Hikvision/NVR). Merged
+    #    with the go2rtc list and deduped below, so it works whether or not
+    #    go2rtc.yaml is in use.
+    if hass is not None:
+        try:
+            cameras = cameras + list_from_hass_states(hass)
+        except Exception as err:  # noqa: BLE001 - discovery must never raise
+            _LOGGER.debug("hass camera enumeration errored (ignored): %s", err)
+    elif not cameras:
+        # 3) Last resort: HA REST states, only when we have no hass object AND
+        #    go2rtc gave us nothing. Needs a long-lived token; usually a no-op.
         try:
             cameras = await _list_from_ha_entities(session, target)
         except Exception as err:  # noqa: BLE001 - discovery must never raise

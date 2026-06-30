@@ -37,3 +37,5 @@ def _load(module_name: str, file_name: str) -> None:
 # so the HA-importing package __init__ never runs.
 _load("custom_components.lazywait.const", "const.py")
 _load("custom_components.lazywait.api", "api.py")
+# camera.py imports only aiohttp + stdlib (no homeassistant), so it loads HA-free.
+_load("custom_components.lazywait.camera", "camera.py")

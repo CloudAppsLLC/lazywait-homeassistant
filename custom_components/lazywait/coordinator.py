@@ -165,7 +165,13 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         session = self._client._session  # noqa: SLF001 - same package reuse
         try:
-            cameras = await list_cameras(session, self._go2rtc_target)
+            # Pass the in-process HomeAssistant instance so discovery can read
+            # camera.* entities straight from hass.states (the reliable path for
+            # Hikvision/NVR channels that never auto-register with go2rtc) — no
+            # token, no HTTP.
+            cameras = await list_cameras(
+                session, self._go2rtc_target, hass=self.hass
+            )
         except Exception as err:  # noqa: BLE001 - discovery must never break us
             _LOGGER.debug("camera discovery errored (ignored): %s", err)
             return
