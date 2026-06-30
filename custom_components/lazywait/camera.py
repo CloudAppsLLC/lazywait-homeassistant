@@ -274,23 +274,49 @@ async def _answer_via_ha_native(
                 # candidates ride non-trickle inside the offer, so we only need
                 # the answer SDP; intermediate WebRTCCandidate messages are
                 # ignored here.
-                if answer_future.done():
-                    return
-                _LOGGER.debug(
-                    "HA native WebRTC message for %s: %s", entity_id, type(message).__name__
-                )
-                if isinstance(message, WebRTCAnswer):
-                    answer_future.set_result(message.sdp)
-                elif isinstance(message, WebRTCError):
-                    # WARNING so the real provider error (e.g. no provider, go2rtc
-                    # unreachable, codec mismatch) is visible in the HA log.
-                    _LOGGER.warning(
-                        "HA native WebRTC error for %s: %s / %s",
+                #
+                # CRITICAL: this callback MUST NOT raise. The go2rtc provider
+                # invokes it from its WS subscriber loop; an exception here is
+                # swallowed by go2rtc as "Error on subscriber callback" and the
+                # answer is LOST (→ our wait_for times out → "no answer"). That
+                # was the actual bug: HA's WebRTCAnswer carries the SDP in
+                # `.answer`, NOT `.sdp` — reading `.sdp` raised AttributeError in
+                # the callback and dropped the answer. Read `.answer` first, fall
+                # back to `.sdp`, and wrap everything so nothing can throw.
+                try:
+                    if answer_future.done():
+                        return
+                    _LOGGER.debug(
+                        "HA native WebRTC message for %s: %s",
                         entity_id,
-                        getattr(message, "code", "?"),
-                        getattr(message, "message", "?"),
+                        type(message).__name__,
                     )
-                    answer_future.set_result(None)
+                    if isinstance(message, WebRTCAnswer):
+                        sdp = (
+                            getattr(message, "answer", None)
+                            or getattr(message, "sdp", None)
+                        )
+                        answer_future.set_result(sdp)
+                    elif isinstance(message, WebRTCError):
+                        # WARNING so the real provider error (no provider, go2rtc
+                        # unreachable, codec mismatch) is visible in the HA log.
+                        _LOGGER.warning(
+                            "HA native WebRTC error for %s: %s / %s",
+                            entity_id,
+                            getattr(message, "code", "?"),
+                            getattr(message, "message", "?"),
+                        )
+                        answer_future.set_result(None)
+                except Exception as cb_err:  # noqa: BLE001 - callback must never raise
+                    _LOGGER.warning(
+                        "HA native WebRTC send_message callback errored for %s "
+                        "(%s message): %s",
+                        entity_id,
+                        type(message).__name__,
+                        cb_err,
+                    )
+                    if not answer_future.done():
+                        answer_future.set_result(None)
 
             session_id = uuid.uuid4().hex
             try:
