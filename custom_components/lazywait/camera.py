@@ -59,11 +59,18 @@ _LOGGER = logging.getLogger(__name__)
 # Cap the go2rtc handshake so a wedged go2rtc can't hang the poll loop.
 _HANDSHAKE_TIMEOUT_SECONDS = 15
 
-# Default go2rtc API base when reached standalone. The HA-bundled go2rtc is
-# reached via the HA proxy form (see _ATTEMPTS). Overridable per entry.
-DEFAULT_GO2RTC_BASE_URL = "http://127.0.0.1:1984"
+# HA-bundled go2rtc (HA 2024.11+) binds its HTTP API on 11984 — the standalone
+# go2rtc default 1984 prefixed with "1" to avoid a port clash. An in-process
+# custom component reaches it DIRECTLY on loopback; there is NO HA proxy path
+# (a live probe of /api/go2rtc/* returns 404 on HA's REST API). Overridable per
+# entry. 1984 is tried only as a fallback for external/standalone go2rtc.
+DEFAULT_GO2RTC_BASE_URL = "http://127.0.0.1:11984"
 
-# Default HA base for the proxied go2rtc form. 127.0.0.1:8123 is HA's local API.
+# Legacy/standalone go2rtc API port — fallback only.
+LEGACY_GO2RTC_BASE_URL = "http://127.0.0.1:1984"
+
+# HA base is retained for REST state enumeration (list_cameras) only — NOT for
+# the go2rtc handshake (the bundled go2rtc is not proxied through HA).
 DEFAULT_HA_BASE_URL = "http://127.0.0.1:8123"
 
 
@@ -121,11 +128,11 @@ def _build_attempts(
     attempts: list[dict[str, Any]] = []
 
     go2rtc_base = target.go2rtc_base_url.rstrip("/")
-    ha_base = target.ha_base_url.rstrip("/")
     # go2rtc expects the offer as an SDP body; src selects the published stream.
     query = f"?src={quote(stream_id, safe='')}" if stream_id else ""
 
-    # 1) Standalone go2rtc API (default port 1984). No auth on the LAN.
+    # 1) HA-bundled go2rtc, DIRECT on its loopback API (default 11984). This is
+    #    the real path for an in-process custom component — no auth on loopback.
     attempts.append(
         {
             "url": f"{go2rtc_base}/api/webrtc{query}",
@@ -134,18 +141,16 @@ def _build_attempts(
         }
     )
 
-    # 2) HA-bundled go2rtc proxied through HA. Auth with the HA long-lived token
-    #    when supplied. THIS PATH/SHAPE is the one to verify against the live HA
-    #    build of go2rtc.
-    ha_headers = {"Content-Type": "application/json"}
-    if target.ha_token:
-        ha_headers["Authorization"] = f"Bearer {target.ha_token}"
-    attempts.append(
-        {
-            "url": f"{ha_base}/api/go2rtc/webrtc{query}",
-            "headers": ha_headers,
-        }
-    )
+    # 2) Legacy/standalone go2rtc on 1984 (only if the configured base wasn't
+    #    already 1984) — covers an external go2rtc / add-on deployment.
+    legacy_base = LEGACY_GO2RTC_BASE_URL.rstrip("/")
+    if legacy_base != go2rtc_base:
+        attempts.append(
+            {
+                "url": f"{legacy_base}/api/webrtc{query}",
+                "headers": {"Content-Type": "application/json"},
+            }
+        )
 
     return attempts
 
@@ -222,12 +227,15 @@ async def answer_offer(
             tried.append({"url": url, "error": str(err)})
             _LOGGER.debug("go2rtc attempt %s failed: %s", url, err)
 
-    # No attempt produced an answer — degrade gracefully with diagnostics.
+    # No attempt produced an answer — degrade gracefully with diagnostics. Log
+    # the exact endpoints + statuses at WARNING (not debug) so a "no signal"
+    # report is debuggable straight from the HA log without enabling debug.
     _LOGGER.warning(
-        "go2rtc handshake unconfirmed for stream %s; tried %s endpoint(s). "
-        "Verify the go2rtc WebRTC route for this HA build (see camera.py docstring).",
+        "go2rtc handshake unconfirmed for stream %s; tried: %s. "
+        "Bundled HA go2rtc listens on 127.0.0.1:11984 — confirm it's running and "
+        "that the camera entity is registered there as a stream.",
         stream_id,
-        len(tried),
+        tried,
     )
     return CameraAnswer(
         answer_sdp=None,
