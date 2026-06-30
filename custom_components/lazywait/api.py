@@ -14,6 +14,7 @@ https://apiv2.lazywait.com/v1):
   POST /integrations/home-assistant/status     — self-reported health heartbeat
   GET  /integrations/home-assistant/camera/poll   — claim a pending WebRTC offer
   POST /integrations/home-assistant/camera/answer — return the SDP answer
+  POST /integrations/home-assistant/camera/cameras — report the discovered list
 """
 
 from __future__ import annotations
@@ -189,6 +190,23 @@ class LazyWaitApiClient:
         url = self._url("/camera/answer")
         body = {"sessionId": session_id, "answer": answer_sdp}
         return await self._authed_request("POST", url, json=body)
+
+    async def report_cameras(
+        self, cameras: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Push HA's discovered camera list to the cloud for the picker.
+
+        POST /integrations/home-assistant/camera/cameras (bearer-authed). The
+        cloud resolves the branch from the token and caches the list in memory
+        (ephemeral — HA re-reports each cycle), serving it to the dashboard so an
+        admin can pick a camera before opening the live view.
+
+        Each camera is { id, name, online? }; `id` is the go2rtc stream src that
+        flows straight back as `cameraId` in the offer. Returns the cloud's
+        response verbatim (e.g. { "ok": true, "count": n }).
+        """
+        url = self._url("/camera/cameras")
+        return await self._authed_request("POST", url, json={"cameras": cameras})
 
     # ── Face attendance (Hikvision) ─────────────────────────────────────────
 

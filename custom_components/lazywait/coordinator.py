@@ -18,6 +18,7 @@ out notifications. The coordinator never decides absence itself.
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from datetime import timedelta
 from typing import Any
@@ -28,7 +29,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import LazyWaitApiClient, LazyWaitApiError, LazyWaitAuthError
-from .camera import Go2RtcTarget, answer_offer
+from .camera import Go2RtcTarget, answer_offer, list_cameras
 from .const import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DOMAIN,
@@ -41,6 +42,11 @@ _LOGGER = logging.getLogger(__name__)
 # Oldest events are dropped first (a stale absence is less useful than a fresh
 # one); the drop is logged so the gap is visible.
 _MAX_BUFFER = 1000
+
+# Throttle camera-list reporting so it can't spam the cloud even if the poll
+# interval is shortened. The default cycle is 30s, so once per cycle is fine;
+# this is the floor between two reports.
+_CAMERA_REPORT_INTERVAL_SECONDS = 30
 
 
 class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -72,6 +78,10 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # to answer with when the cloud offer carries no explicit cameraId.
         self._go2rtc_target = go2rtc_target or Go2RtcTarget()
         self._default_stream_id = default_stream_id
+        # Monotonic timestamp of the last camera-list report; gates the throttle
+        # (0.0 → report on the first cycle). monotonic() so a clock change can't
+        # skew the interval.
+        self._last_camera_report = 0.0
 
     @property
     def branch_id(self) -> str:
@@ -122,8 +132,11 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 last_event_at=self._last_event_at,
             )
 
-            # Best-effort: service any pending live-camera WebRTC offer. This is
-            # isolated so a signaling hiccup never fails the main poll cycle.
+            # Best-effort: report the discovered camera list (throttled) so the
+            # cloud always has a fresh picker, then service any pending
+            # live-camera WebRTC offer. Both are isolated so a camera-path hiccup
+            # never fails the main poll cycle.
+            await self._report_cameras()
             await self._pump_camera_signaling()
 
             return config
@@ -132,6 +145,40 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise ConfigEntryAuthFailed(str(err)) from err
         except LazyWaitApiError as err:
             raise UpdateFailed(f"LazyWait cloud poll failed: {err}") from err
+
+    async def _report_cameras(self) -> None:
+        """Enumerate local cameras and push the list to the cloud (throttled).
+
+        Discovery (go2rtc streams + HA camera entities) is best-effort and never
+        raises; the cloud caches the list in memory and serves it to the
+        dashboard picker. Throttled to ~once per
+        ``_CAMERA_REPORT_INTERVAL_SECONDS`` so a shortened poll interval can't
+        spam the cloud. Strictly best-effort — any failure (other than a dead
+        token, which the calls above already surfaced) is logged and swallowed so
+        the camera path can never break the coordinator cycle.
+        """
+        now = time.monotonic()
+        if now - self._last_camera_report < _CAMERA_REPORT_INTERVAL_SECONDS:
+            return
+        # Stamp BEFORE the await so two cycles can't both slip past the throttle.
+        self._last_camera_report = now
+
+        session = self._client._session  # noqa: SLF001 - same package reuse
+        try:
+            cameras = await list_cameras(session, self._go2rtc_target)
+        except Exception as err:  # noqa: BLE001 - discovery must never break us
+            _LOGGER.debug("camera discovery errored (ignored): %s", err)
+            return
+
+        try:
+            await self._client.report_cameras(cameras)
+            _LOGGER.debug("Reported %s camera(s) to cloud", len(cameras))
+        except LazyWaitAuthError:
+            raise
+        except LazyWaitApiError as err:
+            _LOGGER.debug("camera report failed (ignored): %s", err)
+        except Exception as err:  # noqa: BLE001 - never break the loop
+            _LOGGER.debug("camera report errored (ignored): %s", err)
 
     async def _pump_camera_signaling(self) -> None:
         """Service one pending live-camera WebRTC offer, if any.

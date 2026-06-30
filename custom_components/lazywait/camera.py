@@ -240,6 +240,179 @@ async def answer_offer(
     )
 
 
+def _build_streams_attempts(target: Go2RtcTarget) -> list[dict[str, Any]]:
+    """Ordered go2rtc *streams-list* attempts (the discovery counterpart of the
+    handshake attempts). Each is { url, headers }; the first 200 with a dict body
+    wins. Same two shapes as the handshake:
+
+      1) Standalone go2rtc API:   GET http://127.0.0.1:1984/api/streams
+      2) HA-proxied go2rtc:       GET http://127.0.0.1:8123/api/go2rtc/api/streams
+                                  (Bearer = HA long-lived token)
+
+    go2rtc returns a JSON object keyed by stream id, e.g.
+      { "front_door": { "producers": [...], ... }, "kitchen": { ... } }
+    """
+    attempts: list[dict[str, Any]] = []
+
+    go2rtc_base = target.go2rtc_base_url.rstrip("/")
+    ha_base = target.ha_base_url.rstrip("/")
+
+    attempts.append(
+        {
+            "url": f"{go2rtc_base}/api/streams",
+            "headers": {"Accept": "application/json"},
+        }
+    )
+
+    ha_headers = {"Accept": "application/json"}
+    if target.ha_token:
+        ha_headers["Authorization"] = f"Bearer {target.ha_token}"
+    attempts.append(
+        {
+            "url": f"{ha_base}/api/go2rtc/api/streams",
+            "headers": ha_headers,
+        }
+    )
+
+    return attempts
+
+
+def _parse_go2rtc_streams(payload: Any) -> list[dict[str, Any]]:
+    """Turn go2rtc's ``/api/streams`` body into ``[{id, name, online}]``.
+
+    go2rtc keys the dict by stream id; the value is the stream's producer/info
+    block (shape varies across builds, so we only use the KEY). Presence in the
+    list == online (best-effort). The friendly name defaults to the id; callers
+    may upgrade it from an HA camera entity friendly_name when resolvable.
+    """
+    if not isinstance(payload, dict):
+        return []
+    cameras: list[dict[str, Any]] = []
+    for stream_id in payload:
+        sid = str(stream_id).strip()
+        if not sid:
+            continue
+        cameras.append({"id": sid, "name": sid, "online": True})
+    return cameras
+
+
+async def _list_from_ha_entities(
+    session: aiohttp.ClientSession, target: Go2RtcTarget
+) -> list[dict[str, Any]]:
+    """Secondary source: enumerate HA ``camera.*`` entities via the HA REST API.
+
+    Used only when the go2rtc streams list is empty. HA registers its camera
+    entities with go2rtc under their entity id, so the entity_id doubles as a
+    usable go2rtc ``src``. Requires the HA long-lived token; without one we have
+    no way to read HA states, so we return []. Never raises.
+
+    GET {ha_base}/api/states → a list of state objects; we keep entity_ids that
+    start with "camera." and lift their friendly_name for a nicer label.
+    """
+    if not target.ha_token:
+        return []
+    ha_base = target.ha_base_url.rstrip("/")
+    url = f"{ha_base}/api/states"
+    headers = {
+        "Authorization": f"Bearer {target.ha_token}",
+        "Accept": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=_HANDSHAKE_TIMEOUT_SECONDS)
+    try:
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                return []
+            payload = await _safe_json(resp)
+    except (aiohttp.ClientError, TimeoutError) as err:
+        _LOGGER.debug("HA camera-entity enumeration failed: %s", err)
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    cameras: list[dict[str, Any]] = []
+    for state in payload:
+        if not isinstance(state, dict):
+            continue
+        entity_id = state.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id.startswith("camera."):
+            continue
+        attrs = state.get("attributes")
+        friendly = (
+            attrs.get("friendly_name")
+            if isinstance(attrs, dict) and isinstance(attrs.get("friendly_name"), str)
+            else None
+        )
+        state_val = state.get("state")
+        # "unavailable"/"unknown" → offline; anything else (idle/recording/
+        # streaming) means the entity is reachable.
+        online = state_val not in ("unavailable", "unknown")
+        cameras.append(
+            {
+                "id": entity_id,
+                "name": (friendly or entity_id).strip() or entity_id,
+                "online": bool(online),
+            }
+        )
+    return cameras
+
+
+async def list_cameras(
+    session: aiohttp.ClientSession, target: Go2RtcTarget
+) -> list[dict[str, Any]]:
+    """Discover the branch's cameras for the cloud/dashboard picker.
+
+    Returns ``[{ "id": str, "name": str, "online": bool }]`` where ``id`` is the
+    go2rtc stream ``src`` (opaque to the cloud; fed straight back as ``cameraId``
+    into the offer flow). Strategy:
+
+      1. Enumerate go2rtc streams (``/api/streams``) — the authoritative list,
+         tried standalone then HA-proxied (see ``_build_streams_attempts``).
+      2. If that yields nothing, fall back to HA ``camera.*`` entities via the HA
+         REST API and merge/dedupe by id.
+
+    Best-effort and NEVER raises — returns ``[]`` on total failure so the
+    coordinator's report step can't break the poll loop.
+    """
+    timeout = aiohttp.ClientTimeout(total=_HANDSHAKE_TIMEOUT_SECONDS)
+    cameras: list[dict[str, Any]] = []
+
+    for attempt in _build_streams_attempts(target):
+        url = attempt["url"]
+        headers = attempt["headers"]
+        try:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status != 200:
+                    continue
+                payload = await _safe_json(resp)
+        except (aiohttp.ClientError, TimeoutError) as err:  # noqa: PERF203
+            _LOGGER.debug("go2rtc streams attempt %s failed: %s", url, err)
+            continue
+        parsed = _parse_go2rtc_streams(payload)
+        if parsed:
+            cameras = parsed
+            break
+
+    # Secondary source: HA camera entities, only when go2rtc gave us nothing.
+    if not cameras:
+        try:
+            cameras = await _list_from_ha_entities(session, target)
+        except Exception as err:  # noqa: BLE001 - discovery must never raise
+            _LOGGER.debug("HA camera-entity fallback errored (ignored): %s", err)
+            cameras = []
+
+    # Dedupe by id, preserving first-seen order (go2rtc wins over HA entity).
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for cam in cameras:
+        cid = cam.get("id")
+        if not isinstance(cid, str) or cid in seen:
+            continue
+        seen.add(cid)
+        deduped.append(cam)
+    return deduped
+
+
 def _extract_answer_sdp(payload: Any) -> str | None:
     """Pull the SDP answer string out of go2rtc's response.
 

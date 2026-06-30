@@ -212,6 +212,15 @@ handshake, never the video.
    connect **peer-to-peer** over Twilio TURN. **Video never touches the cloud** —
    only the SDP offer/answer does.
 
+**Cameras are auto-discovered.** You don't list them anywhere. On each poll cycle
+(throttled to ~once every 30s) the integration enumerates the local go2rtc
+streams (`GET /api/streams`, falling back to HA `camera.*` entities) and **reports
+the list outbound** to the cloud, which caches it and serves it to the dashboard
+picker. Each camera is `{ id, name, online }` where `id` is the go2rtc stream
+`src` — the dashboard hands that `id` straight back as `cameraId` when it opens a
+stream. Discovery is best-effort: if go2rtc isn't reachable, the list is simply
+empty and the live view degrades gracefully.
+
 **What you need:**
 
 - go2rtc is bundled in modern Home Assistant. Your camera must be published as a
@@ -245,6 +254,7 @@ All under the configured base URL + `/integrations/home-assistant`:
 | POST | `/status` | bearer | self-reported health heartbeat |
 | GET | `/camera/poll` | bearer | claim a pending live-camera WebRTC offer |
 | POST | `/camera/answer` | bearer | return the SDP answer for a session |
+| POST | `/camera/cameras` | bearer | report the auto-discovered camera list |
 
 The bearer is the token minted by `/pair`. The cloud resolves your branch from
 the token — Home Assistant never sends the branch id in a request body.
