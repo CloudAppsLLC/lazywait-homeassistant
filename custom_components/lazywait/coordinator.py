@@ -29,7 +29,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from . import automations, control
 from .api import LazyWaitApiClient, LazyWaitApiError, LazyWaitAuthError
 from .camera import Go2RtcTarget, answer_offer, list_cameras
 from .const import (
@@ -332,6 +331,14 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _execute_admin_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Execute one queued command via the in-process executors. Mirrors the
         WS client's dispatch so both paths run identical logic."""
+        # Lazy import to break a circular import: __init__.py imports this module
+        # (coordinator) at top level, so a top-level `from . import automations,
+        # control` here re-enters the partially-initialized package and HA fails
+        # the whole integration with "cannot import name 'automations' ... most
+        # likely due to a circular import". Importing the submodules HERE (after
+        # the package finished initializing) sidesteps the cycle entirely.
+        from . import automations, control  # noqa: PLC0415
+
         try:
             kind = command.get("kind")
             if kind == "call_service":

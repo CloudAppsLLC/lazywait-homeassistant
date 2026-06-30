@@ -30,7 +30,6 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from . import automations, control
 from .api import LazyWaitApiClient
 from .const import (
     ADMIN_WS_BACKOFF_CAP_SECONDS,
@@ -160,6 +159,8 @@ class LazyWaitAdminSocket:
         )
 
     async def _send_full_snapshot(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        from . import control  # noqa: PLC0415 - lazy: avoid circular import via __init__
+
         entities = control.build_state_snapshot(self._hass)
         await ws.send_str(
             json.dumps(
@@ -214,6 +215,8 @@ class LazyWaitAdminSocket:
 
     async def _execute(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Dispatch one command to the in-process executors. Never raises."""
+        from . import control  # noqa: PLC0415 - lazy: avoid circular import via __init__
+
         try:
             kind = frame.get("kind")
             if kind == "call_service":
@@ -231,6 +234,8 @@ class LazyWaitAdminSocket:
             return {"status": "error", "errorKey": "HA_COMMAND_FAILED"}
 
     async def _execute_automation(self, frame: dict[str, Any]) -> dict[str, Any]:
+        from . import automations  # noqa: PLC0415 - lazy: avoid circular import via __init__
+
         op = frame.get("op")
         target = frame.get("target") or {}
         data = frame.get("data") or {}
