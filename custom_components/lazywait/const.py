@@ -24,7 +24,7 @@ CONF_PAIRING_CODE = "pairing_code"
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 
 # Identifies this component build to the cloud /status heartbeat.
-INTEGRATION_VERSION = "26.6.10"
+INTEGRATION_VERSION = "26.6.11"
 # Event types the component can emit to the cloud. Mirrors the cloud's
 # discriminated union (absence | presence | device_state).
 EVENT_ABSENCE = "absence"
