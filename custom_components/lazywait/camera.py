@@ -1,18 +1,32 @@
-"""Live camera WebRTC answerer — bridges a cloud SDP offer to go2rtc.
+"""Live camera WebRTC answerer — bridges a cloud SDP offer to a local camera.
 
 The dashboard is one WebRTC peer; HA/go2rtc is the other. The cloud relays
 SIGNALING ONLY (SDP offer/answer; ICE candidates bundled non-trickle inside the
 SDP). Media flows peer-to-peer over Twilio TURN — it never touches the cloud.
 HA is outbound-only behind NAT, so it cannot accept an inbound WebRTC peer
-connection directly; instead it POLLS the cloud for a pending offer, asks the
-LOCAL go2rtc (bundled in HA) to produce an answer for that offer against a named
-stream, and POSTs the answer back to the cloud.
+connection directly; instead it POLLS the cloud for a pending offer, produces an
+answer for that offer against a named camera/stream, and POSTs the answer back
+to the cloud.
 
-go2rtc handshake — THE ONE CALL THAT NEEDS LIVE VERIFICATION
-============================================================
+PRIMARY path — HA's NATIVE camera WebRTC API (no port guessing)
+===============================================================
+The integration runs IN-PROCESS and holds the ``hass`` object, so it asks HA's
+own camera component to answer the offer via
+``Camera.async_handle_async_webrtc_offer(offer, session_id, send_message)``.
+HA Core already owns a correctly configured WebRTC provider — the go2rtc
+integration registered itself as a ``CameraWebRTCProvider`` at go2rtc's REAL
+url during its own setup — so HA routes the offer there with NO loopback port
+assumptions and NO HA token. This fixes the historic failure where POSTing the
+offer to a guessed go2rtc loopback port (11984 / 1984) returned "Cannot connect
+to host" and the dashboard polled forever (status:"offered", answer:null).
+See ``_answer_via_ha_native`` below.
+
+go2rtc handshake — FALLBACK ONLY (last resort if the native path can't answer)
+==============================================================================
 go2rtc exposes a one-shot WebRTC exchange: you POST an SDP *offer* and it
-returns an SDP *answer* for a named source stream. The exact route depends on
-how go2rtc is reached:
+returns an SDP *answer* for a named source stream. This is now a FALLBACK,
+tried only when the native camera API is unavailable / the entity has no WebRTC
+support / it timed out. The exact route depends on how go2rtc is reached:
 
   * Standalone go2rtc (default API port 1984):
         POST http://<go2rtc-host>:1984/api/webrtc?src=<stream_id>
@@ -47,7 +61,9 @@ config entry / HA runtime, never hard-coded.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -155,6 +171,144 @@ def _build_attempts(
     return attempts
 
 
+async def _answer_via_ha_native(
+    hass: Any,
+    *,
+    entity_id: str,
+    offer_sdp: str,
+) -> str | None:
+    """Get an SDP answer from HA's native camera WebRTC API for a camera entity.
+
+    This is the ROBUST path: HA Core's camera component already owns a correctly
+    configured WebRTC provider (the go2rtc integration registered itself at
+    go2rtc's REAL url during its own setup). We hand the offer to the camera
+    entity and let HA route it — no port guessing, no loopback assumptions, no
+    HA token. Works for any camera with ``CameraEntityFeature.STREAM`` (Hikvision
+    NVR channels through go2rtc qualify).
+
+    ``async_handle_async_webrtc_offer`` is fire-and-forget: it returns ``None``
+    and delivers the result later through the ``send_message`` callback. We
+    bridge that into an awaitable Future resolved on the first
+    ``WebRTCAnswer`` / ``WebRTCError``. Older HA builds (pre-unified provider
+    API) instead expose ``async_handle_web_rtc_offer(offer) -> str`` which
+    returns the answer SDP directly; we try that as a secondary native shape.
+
+    Returns the answer SDP, or ``None`` if HA has no camera entity / no WebRTC
+    provider / errored / timed out — the caller then falls back to the go2rtc
+    POST. NEVER raises.
+    """
+    if hass is None or not entity_id or not entity_id.startswith("camera."):
+        return None
+
+    # Lazy, defensive imports — keep camera.py importable in the bare (HA-free)
+    # test environment, and tolerate the camera WebRTC symbols moving between HA
+    # releases. If they're absent we degrade to the go2rtc-POST fallback.
+    try:
+        from homeassistant.components.camera import (  # type: ignore
+            CameraEntityFeature,
+            get_camera_from_entity_id,
+        )
+    except Exception as err:  # noqa: BLE001 - missing API → use fallback
+        _LOGGER.debug("HA native camera API unavailable: %s", err)
+        return None
+
+    try:
+        camera = get_camera_from_entity_id(hass, entity_id)
+    except Exception as err:  # noqa: BLE001 - HomeAssistantError if not found
+        _LOGGER.debug("camera entity %s not resolvable for native WebRTC: %s", entity_id, err)
+        return None
+
+    # Camera must advertise STREAM to participate in WebRTC.
+    try:
+        has_stream = bool(
+            int(getattr(camera, "supported_features", 0)) & int(CameraEntityFeature.STREAM)
+        )
+    except Exception:  # noqa: BLE001 - odd feature shape → assume usable, let HA decide
+        has_stream = True
+    if not has_stream:
+        _LOGGER.debug("camera %s has no STREAM feature; native WebRTC skipped", entity_id)
+        return None
+
+    # Preferred: the unified async provider API (HA 2024.11+ through 2026.6.x).
+    handle_async = getattr(camera, "async_handle_async_webrtc_offer", None)
+    if callable(handle_async):
+        try:
+            from homeassistant.components.camera.webrtc import (  # type: ignore
+                WebRTCAnswer,
+                WebRTCError,
+            )
+        except Exception as err:  # noqa: BLE001 - message types moved → try legacy shape
+            _LOGGER.debug("HA WebRTC message types unavailable: %s", err)
+        else:
+            loop = asyncio.get_running_loop()
+            answer_future: asyncio.Future[str | None] = loop.create_future()
+
+            def _send_message(message: Any) -> None:
+                # Resolve on the FIRST terminal message (answer or error). ICE
+                # candidates ride non-trickle inside the offer, so we only need
+                # the answer SDP; intermediate WebRTCCandidate messages are
+                # ignored here.
+                if answer_future.done():
+                    return
+                if isinstance(message, WebRTCAnswer):
+                    answer_future.set_result(message.sdp)
+                elif isinstance(message, WebRTCError):
+                    _LOGGER.debug(
+                        "HA native WebRTC error for %s: %s/%s",
+                        entity_id,
+                        getattr(message, "code", "?"),
+                        getattr(message, "message", "?"),
+                    )
+                    answer_future.set_result(None)
+
+            session_id = uuid.uuid4().hex
+            try:
+                # Fire-and-forget: returns None; the answer comes via _send_message.
+                await handle_async(offer_sdp, session_id, _send_message)
+                answer = await asyncio.wait_for(
+                    answer_future, timeout=_HANDSHAKE_TIMEOUT_SECONDS
+                )
+                if answer:
+                    _LOGGER.info(
+                        "HA native camera WebRTC answered offer for %s", entity_id
+                    )
+                return answer
+            except (asyncio.TimeoutError, asyncio.CancelledError) as err:
+                _LOGGER.debug("HA native WebRTC offer timed out for %s: %s", entity_id, err)
+                return None
+            except Exception as err:  # noqa: BLE001 - any provider error → fallback
+                _LOGGER.debug("HA native WebRTC offer failed for %s: %s", entity_id, err)
+                return None
+            finally:
+                # Best-effort teardown so the provider doesn't hold the session open.
+                close = getattr(camera, "close_webrtc_session", None)
+                if callable(close):
+                    try:
+                        close(session_id)
+                    except Exception:  # noqa: BLE001 - teardown is best-effort
+                        pass
+
+    # Legacy native shape (older HA): returns the answer SDP directly.
+    handle_sync = getattr(camera, "async_handle_web_rtc_offer", None)
+    if callable(handle_sync):
+        try:
+            answer = await asyncio.wait_for(
+                handle_sync(offer_sdp), timeout=_HANDSHAKE_TIMEOUT_SECONDS
+            )
+        except Exception as err:  # noqa: BLE001 - any error → fallback
+            _LOGGER.debug("HA legacy native WebRTC offer failed for %s: %s", entity_id, err)
+            return None
+        if isinstance(answer, str) and answer.strip():
+            _LOGGER.info(
+                "HA native camera WebRTC (legacy) answered offer for %s", entity_id
+            )
+            return answer
+        return None
+
+    _LOGGER.debug("camera %s exposes no native WebRTC offer handler", entity_id)
+    return None
+
+
 async def answer_offer(
     session: aiohttp.ClientSession,
     target: Go2RtcTarget,
@@ -163,35 +317,63 @@ async def answer_offer(
     offer_sdp: str,
     default_stream_id: str = "",
     rtsp_fallback_url: str | None = None,
+    hass: Any = None,
 ) -> CameraAnswer:
-    """Ask the local go2rtc to answer a cloud WebRTC offer.
+    """Answer a cloud WebRTC offer — HA-native first, go2rtc POST as fallback.
 
-    Tries each go2rtc handshake shape (see ``_build_attempts``) in order. On the
-    first 200 carrying an SDP answer, returns ``CameraAnswer(answer_sdp=...)``.
-    If no attempt produces an answer, returns a ``CameraAnswer`` with
-    ``answer_sdp=None`` and a ``fallback`` dict describing what was tried + the
-    RTSP/stream info, so the caller can log a precise "go2rtc handshake
-    unconfirmed" and (optionally) surface the RTSP URL for a non-WebRTC viewer.
+    Resolution order:
+      1. **HA native** (``_answer_via_ha_native``) when ``hass`` is available and
+         ``camera_id`` is a ``camera.*`` entity id — hands the offer to HA's
+         camera component, which routes to the correctly configured go2rtc
+         provider with NO port guessing. This is the primary, reliable path.
+      2. **go2rtc POST fallback** (see ``_build_attempts``) — the historic
+         loopback-port handshake, tried ONLY if the native path produced no
+         answer. On the first 200 carrying an SDP answer, returns
+         ``CameraAnswer(answer_sdp=...)``.
+
+    If neither produces an answer, returns a ``CameraAnswer`` with
+    ``answer_sdp=None`` and a ``fallback`` dict describing what was tried
+    (native error + go2rtc statuses) + the RTSP/stream info, so the caller can
+    log a precise "no answer" reason and (optionally) surface the RTSP URL for a
+    non-WebRTC viewer.
 
     Never raises — a failed handshake must not break the coordinator poll loop.
 
     Args:
-        session: shared HA aiohttp session.
+        session: shared HA aiohttp session (used by the go2rtc fallback only).
         target: go2rtc / HA endpoints + optional HA token.
-        camera_id: stream id from the cloud offer ("" → default_stream_id).
+        camera_id: stream id / ``camera.*`` entity id from the cloud offer
+            ("" → default_stream_id for the go2rtc fallback).
         offer_sdp: the dashboard's SDP offer (ICE bundled non-trickle).
         default_stream_id: go2rtc stream to use when camera_id is empty.
         rtsp_fallback_url: optional RTSP URL to include in the fallback info.
+        hass: in-process HomeAssistant object; enables the native path.
     """
+    # 1) NATIVE first — let HA's camera component answer using its correctly
+    #    configured WebRTC provider (no loopback port guessing). Requires hass +
+    #    a camera.* entity id. Never raises.
+    native_error: str | None = None
+    if hass is not None and (camera_id or "").startswith("camera."):
+        native_answer = await _answer_via_ha_native(
+            hass, entity_id=camera_id, offer_sdp=offer_sdp
+        )
+        if native_answer:
+            return CameraAnswer(answer_sdp=native_answer)
+        native_error = "native path returned no answer (see debug log)"
+
+    # 2) go2rtc POST fallback (legacy loopback handshake).
     stream_id = _resolve_stream_id(camera_id, default_stream_id)
     if not stream_id:
         _LOGGER.warning(
-            "go2rtc answer skipped: no stream id (camera_id empty and no default)"
+            "Live camera: no answer — native path: %s; and no go2rtc stream id "
+            "(camera_id empty and no default).",
+            native_error or "not attempted (no hass / not a camera.* entity)",
         )
         return CameraAnswer(
             answer_sdp=None,
             fallback={
                 "reason": "no_stream_id",
+                "native_error": native_error,
                 "rtsp": rtsp_fallback_url,
             },
         )
@@ -227,21 +409,28 @@ async def answer_offer(
             tried.append({"url": url, "error": str(err)})
             _LOGGER.debug("go2rtc attempt %s failed: %s", url, err)
 
-    # No attempt produced an answer — degrade gracefully with diagnostics. Log
-    # the exact endpoints + statuses at WARNING (not debug) so a "no signal"
-    # report is debuggable straight from the HA log without enabling debug.
+    # Neither the native path nor the go2rtc fallback produced an answer —
+    # degrade gracefully with diagnostics. Log at WARNING (not debug) so a "no
+    # signal from camera" report is debuggable straight from the HA log without
+    # enabling debug. Show BOTH what the native path did and the go2rtc statuses.
     _LOGGER.warning(
-        "go2rtc handshake unconfirmed for stream %s; tried: %s. "
-        "Bundled HA go2rtc listens on 127.0.0.1:11984 — confirm it's running and "
-        "that the camera entity is registered there as a stream.",
+        "Live camera: NO ANSWER for stream %s. "
+        "Native HA camera WebRTC path: %s. "
+        "go2rtc loopback fallback tried: %s. "
+        "If the camera supports WebRTC, the native path should answer; check that "
+        "the camera entity exists and exposes CameraEntityFeature.STREAM. The "
+        "go2rtc loopback ports (11984/1984) are only a last resort and are not "
+        "reachable in many HA OS setups.",
         stream_id,
+        native_error or "not attempted (no hass / not a camera.* entity id)",
         tried,
     )
     return CameraAnswer(
         answer_sdp=None,
         fallback={
-            "reason": "go2rtc_handshake_unconfirmed",
+            "reason": "no_answer",
             "stream_id": stream_id,
+            "native_error": native_error,
             "tried": tried,
             "rtsp": rtsp_fallback_url,
         },

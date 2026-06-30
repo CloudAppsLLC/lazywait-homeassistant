@@ -17,17 +17,19 @@ out notifications. The coordinator never decides absence itself.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import deque
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from . import automations, control
 from .api import LazyWaitApiClient, LazyWaitApiError, LazyWaitAuthError
 from .camera import Go2RtcTarget, answer_offer, list_cameras
 from .const import (
@@ -35,6 +37,9 @@ from .const import (
     DOMAIN,
     INTEGRATION_VERSION,
 )
+
+if TYPE_CHECKING:
+    from .ws_client import LazyWaitAdminSocket
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +87,31 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # (0.0 → report on the first cycle). monotonic() so a clock change can't
         # skew the interval.
         self._last_camera_report = 0.0
+        # The persistent admin-control WebSocket + its task, attached after setup.
+        # When the socket is connected, control flows over it (sub-second); when
+        # it's down, the coordinator drains queued commands over the 30s poll.
+        self._admin_socket: LazyWaitAdminSocket | None = None
+        self._admin_task: asyncio.Task | None = None
+
+    def attach_admin_socket(
+        self, socket: LazyWaitAdminSocket, task: asyncio.Task
+    ) -> None:
+        """Record the admin WebSocket + its task (started in async_setup_entry)."""
+        self._admin_socket = socket
+        self._admin_task = task
+
+    async def shutdown_admin_socket(self) -> None:
+        """Stop + cancel the admin socket task (on unload)."""
+        if self._admin_socket is not None:
+            await self._admin_socket.stop()
+        if self._admin_task is not None:
+            self._admin_task.cancel()
+            try:
+                await self._admin_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._admin_socket = None
+        self._admin_task = None
 
     @property
     def branch_id(self) -> str:
@@ -139,6 +169,12 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._report_cameras()
             await self._pump_camera_signaling()
 
+            # Degraded admin-control path: when the persistent WebSocket is down,
+            # drain any queued admin commands over this HTTP poll so control
+            # still works (within ~30s) instead of silently stalling. Best-effort
+            # and isolated — never fails the main cycle.
+            await self._drain_admin_commands()
+
             return config
         except LazyWaitAuthError as err:
             # Token rotated/revoked → HA opens the reauth flow.
@@ -190,9 +226,13 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Service one pending live-camera WebRTC offer, if any.
 
         Polls the cloud for a pending SDP offer for this branch; when present,
-        asks the local go2rtc to produce an answer and posts it back. This is
-        SIGNALING ONLY — the resulting media flows peer-to-peer (dashboard <->
-        go2rtc) over Twilio TURN and never traverses HA's poll path.
+        produces an answer and posts it back. The answer comes from HA's NATIVE
+        camera WebRTC API first (``answer_offer`` hands the offer to the camera
+        component, which routes to its correctly configured go2rtc provider —
+        no loopback port guessing), with the legacy go2rtc loopback POST as a
+        last-resort fallback. This is SIGNALING ONLY — the resulting media flows
+        peer-to-peer (dashboard <-> go2rtc) over Twilio TURN and never traverses
+        HA's poll path.
 
         Strictly best-effort: any failure is logged and swallowed so the camera
         path can never break the main coordinator cycle. A LazyWaitAuthError is
@@ -220,20 +260,26 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("camera poll returned a malformed pending offer; skipping")
             return
 
-        # Reuse the API client's aiohttp session for the local go2rtc call.
+        # Reuse the API client's aiohttp session for the go2rtc fallback call.
         session = self._client._session  # noqa: SLF001 - same package reuse
 
+        # Pass the in-process HomeAssistant object + the signaling session id so
+        # answer_offer can use HA's NATIVE camera WebRTC API first (HA routes the
+        # offer to its correctly configured go2rtc provider — no loopback port
+        # guessing). The go2rtc loopback POST stays as a last-resort fallback
+        # inside answer_offer.
         result = await answer_offer(
             session,
             self._go2rtc_target,
             camera_id=camera_id,
             offer_sdp=offer_sdp,
             default_stream_id=self._default_stream_id,
+            hass=self.hass,
         )
 
         if not result.ok or not result.answer_sdp:
             _LOGGER.warning(
-                "Live camera: go2rtc produced no answer for session %s (%s)",
+                "Live camera: no SDP answer for session %s (%s)",
                 session_id,
                 (result.fallback or {}).get("reason") if result.fallback else "unknown",
             )
@@ -248,6 +294,81 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("camera answer post failed (ignored): %s", err)
         except Exception as err:  # noqa: BLE001 - never break the loop
             _LOGGER.debug("camera answer post errored (ignored): %s", err)
+
+    async def _drain_admin_commands(self) -> None:
+        """When the admin WS is down, claim + execute queued admin commands over
+        the HTTP poll, then post the result. One command per cycle keeps it
+        simple; the WS path handles the fast/common case. Best-effort: any error
+        is logged and swallowed so the camera/event path is never affected."""
+        # If the persistent socket is up, it's already servicing commands — skip.
+        if self._admin_socket is not None and self._admin_socket.is_connected:
+            return
+        try:
+            resp = await self._client.poll_commands()
+        except LazyWaitAuthError:
+            raise
+        except LazyWaitApiError as err:
+            _LOGGER.debug("admin command poll failed (ignored): %s", err)
+            return
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("admin command poll errored (ignored): %s", err)
+            return
+
+        if not isinstance(resp, dict) or not resp.get("pending"):
+            return
+        command = resp.get("command")
+        if not isinstance(command, dict):
+            return
+        command_id = command.get("commandId")
+        if not command_id:
+            return
+
+        result = await self._execute_admin_command(command)
+        try:
+            await self._client.post_command_result(str(command_id), result)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("admin command result post failed (ignored): %s", err)
+
+    async def _execute_admin_command(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Execute one queued command via the in-process executors. Mirrors the
+        WS client's dispatch so both paths run identical logic."""
+        try:
+            kind = command.get("kind")
+            if kind == "call_service":
+                return await control.call_device_service(self.hass, command)
+            if kind == "get_state":
+                return {
+                    "status": "ok",
+                    "result": {"entities": control.build_state_snapshot(self.hass)},
+                }
+            if kind == "automation_op":
+                op = command.get("op")
+                target = command.get("target") or {}
+                data = command.get("data") or {}
+                aid = target.get("automation_id")
+                if op == "list":
+                    return {"status": "ok", "result": automations.list_automations(self.hass)}
+                if op == "get_config" and aid:
+                    return await automations.get_config(self.hass, str(aid))
+                if op == "enable" and aid:
+                    return await automations.set_enabled(self.hass, str(aid), True)
+                if op == "disable" and aid:
+                    return await automations.set_enabled(self.hass, str(aid), False)
+                if op == "trigger" and aid:
+                    return await automations.trigger(self.hass, str(aid))
+                if op == "reload":
+                    return await automations.reload(self.hass)
+                if op == "upsert":
+                    config = data.get("config") if isinstance(data, dict) else None
+                    if not isinstance(config, dict):
+                        return {"status": "error", "errorKey": "HA_AUTOMATION_WRITE_FAILED"}
+                    return await automations.upsert(self.hass, aid, config)
+                if op == "delete" and aid:
+                    return await automations.delete(self.hass, str(aid))
+            return {"status": "error", "errorKey": "HA_COMMAND_FAILED"}
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("admin command execution errored: %s", err)
+            return {"status": "error", "errorKey": "HA_COMMAND_FAILED"}
 
     async def _flush_events(self) -> None:
         """Drain the buffer to the cloud; re-buffer on failure for next cycle."""
