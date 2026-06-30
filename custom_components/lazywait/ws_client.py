@@ -95,7 +95,14 @@ class LazyWaitAdminSocket:
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - loop must never die
-                _LOGGER.debug("Admin WS error; backing off: %s", err)
+                # WARNING (not debug) so a persistent connect failure is visible
+                # in the HA log instead of silently backing off forever. Includes
+                # the exception type so a TLS/DNS/handshake cause is identifiable.
+                _LOGGER.warning(
+                    "Admin WS connect/serve failed (%s: %s); backing off",
+                    type(err).__name__,
+                    err,
+                )
 
             if self._stopped:
                 return
@@ -114,10 +121,12 @@ class LazyWaitAdminSocket:
     async def _connect_and_serve(self) -> None:
         url = self._client.ws_url(ADMIN_WS_PATH)
         headers = self._client.auth_headers()
+        _LOGGER.info("Admin WS connecting to %s", url)
         async with self._client.session.ws_connect(
             url, headers=headers, heartbeat=_WS_HEARTBEAT
         ) as ws:
             self._ws = ws
+            _LOGGER.info("Admin WS connected (branch %s)", self._branch_id)
             await self._send_hello(ws)
             await self._send_full_snapshot(ws)
             async for msg in ws:
