@@ -46,6 +46,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Transient cloud/network issue → HA retries setup later.
         raise ConfigEntryNotReady(f"LazyWait ping failed: {err}") from err
 
+    # INFO (not debug) — ping passed, so the token is good. Its presence in the
+    # HA log proves setup got past auth; its absence means the ping/token failed.
+    _LOGGER.info("LazyWait setup: token OK for branch %s, starting coordinator", branch_id)
+
     coordinator = LazyWaitCoordinator(hass, client, branch_id)
     await coordinator.async_config_entry_first_refresh()
 
@@ -58,6 +62,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     admin_socket = LazyWaitAdminSocket(hass, entry, client, branch_id)
     admin_task = hass.loop.create_task(admin_socket.run())
     coordinator.attach_admin_socket(admin_socket, admin_task)
+    # INFO — confirms the admin-WS task was actually created. If this appears but
+    # "Admin WS connecting to ..." never does, the task died before its first
+    # connect (import error at module load, ws_url build, etc.).
+    _LOGGER.info("LazyWait setup: admin-WS task created for branch %s", branch_id)
 
     # Start the near-live camera snapshot loop (~1s): captures a JPEG for each
     # camera the dashboard is viewing now and posts it. This is the SIMPLE

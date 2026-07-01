@@ -24,8 +24,7 @@ CONF_PAIRING_CODE = "pairing_code"
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 
 # Identifies this component build to the cloud /status heartbeat.
-INTEGRATION_VERSION = "26.7.2"
-
+INTEGRATION_VERSION = "26.7.3"
 # ── Near-live camera snapshot loop ──────────────────────────────────────────
 # A SEPARATE lightweight loop (not the 30s poll) captures a JPEG for each camera
 # the dashboard is viewing NOW and posts it, giving a ~1 fps near-live view

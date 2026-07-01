@@ -123,6 +123,9 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._snapshot_task is not None:
             return
         self._snapshot_task = self.hass.loop.create_task(self._snapshot_loop())
+        # INFO (not debug) so the HA log CONFIRMS the near-live loop started —
+        # its absence in the log means setup never reached here.
+        _LOGGER.info("LazyWait near-live snapshot loop started (branch %s)", self._branch_id)
 
     async def shutdown_admin_socket(self) -> None:
         """Stop the admin socket task + snapshot loop + media-relay pushers (unload)."""
@@ -221,17 +224,32 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         captured = await capture_snapshot(self.hass, camera_id)
         if captured is None:
+            # WARNING (not silent) — this is THE failure that shows a black
+            # "no signal" panel: HA couldn't get a still frame for the camera
+            # (async_get_image failed / camera unavailable / no stream). Visible
+            # so the cause is diagnosable from the HA log.
+            _LOGGER.warning(
+                "LazyWait snapshot: capture returned NO image for %s "
+                "(camera_proxy/async_get_image failed — camera unavailable or "
+                "no still available)",
+                camera_id,
+            )
             return
         content, content_type = captured
         try:
             await self._client.post_snapshot(
                 camera_id, encode_snapshot(content), content_type
             )
-            _LOGGER.debug("posted snapshot for %s (%s bytes)", camera_id, len(content))
+            _LOGGER.info(
+                "LazyWait snapshot: posted %s (%s bytes) for %s",
+                content_type,
+                len(content),
+                camera_id,
+            )
         except LazyWaitApiError as err:
-            _LOGGER.debug("snapshot post failed for %s (ignored): %s", camera_id, err)
+            _LOGGER.warning("LazyWait snapshot POST failed for %s: %s", camera_id, err)
         except Exception as err:  # noqa: BLE001 - never break the loop
-            _LOGGER.debug("snapshot post errored for %s (ignored): %s", camera_id, err)
+            _LOGGER.warning("LazyWait snapshot POST errored for %s: %s", camera_id, err)
 
     @property
     def branch_id(self) -> str:

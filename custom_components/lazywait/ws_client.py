@@ -74,6 +74,11 @@ class LazyWaitAdminSocket:
 
     async def run(self) -> None:
         """Connect-and-serve loop with backoff. Returns only when stopped."""
+        # INFO — proves the bare task actually started running. A bare
+        # asyncio.Task that raises before any log line swallows the error
+        # silently; this line rules that out (if it's absent, the task never
+        # got scheduled or the coroutine failed at creation).
+        _LOGGER.info("Admin WS run loop started (branch %s)", self._branch_id)
         backoff = ADMIN_WS_BACKOFF_START_SECONDS
         while not self._stopped:
             try:
