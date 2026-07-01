@@ -36,6 +36,7 @@ from .const import (
     DOMAIN,
     INTEGRATION_VERSION,
 )
+from .mediarelay import MediaRelayManager
 
 if TYPE_CHECKING:
     from .ws_client import LazyWaitAdminSocket
@@ -91,6 +92,10 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # it's down, the coordinator drains queued commands over the 30s poll.
         self._admin_socket: LazyWaitAdminSocket | None = None
         self._admin_task: asyncio.Task | None = None
+        # Branch-side stream push: ffmpeg pullers that pull the local NVR RTSP and
+        # push SRT to the cloud MediaMTX. Driven entirely by config.media_relay;
+        # reconciled each cycle. Best-effort — never breaks the poll loop.
+        self._media_relay = MediaRelayManager(hass)
 
     def attach_admin_socket(
         self, socket: LazyWaitAdminSocket, task: asyncio.Task
@@ -100,7 +105,7 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._admin_task = task
 
     async def shutdown_admin_socket(self) -> None:
-        """Stop + cancel the admin socket task (on unload)."""
+        """Stop the admin socket task + media-relay pushers (on unload)."""
         if self._admin_socket is not None:
             await self._admin_socket.stop()
         if self._admin_task is not None:
@@ -111,6 +116,8 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pass
         self._admin_socket = None
         self._admin_task = None
+        # Tear down any running ffmpeg SRT pushers so they don't outlive the entry.
+        await self._media_relay.stop_all()
 
     @property
     def branch_id(self) -> str:
@@ -173,6 +180,12 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # still works (within ~30s) instead of silently stalling. Best-effort
             # and isolated — never fails the main cycle.
             await self._drain_admin_commands()
+
+            # Branch-side stream push: converge the ffmpeg SRT pushers onto the
+            # cloud's media_relay directive (start enabled cameras, stop removed
+            # ones, restart dead ones). Best-effort and isolated inside the
+            # manager — never fails this cycle.
+            await self._media_relay.reconcile(config.get("media_relay"))
 
             return config
         except LazyWaitAuthError as err:
