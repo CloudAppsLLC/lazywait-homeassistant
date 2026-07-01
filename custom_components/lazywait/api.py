@@ -15,6 +15,8 @@ https://apiv2.lazywait.com/v1):
   GET  /integrations/home-assistant/camera/poll   — claim a pending WebRTC offer
   POST /integrations/home-assistant/camera/answer — return the SDP answer
   POST /integrations/home-assistant/camera/cameras — report the discovered list
+  GET  /integrations/home-assistant/camera/snapshot/requests — cameras viewed now
+  POST /integrations/home-assistant/camera/snapshot — upload a near-live snapshot
 """
 
 from __future__ import annotations
@@ -189,6 +191,49 @@ class LazyWaitApiClient:
         """
         url = self._url("/camera/answer")
         body = {"sessionId": session_id, "answer": answer_sdp}
+        return await self._authed_request("POST", url, json=body)
+
+    async def snapshot_requests(self) -> dict[str, Any]:
+        """Poll which cameras the dashboard is viewing NOW (near-live snapshot).
+
+        GET /integrations/home-assistant/camera/snapshot/requests (bearer-authed;
+        the cloud resolves the branch from the token). Returns the cloud's
+        response verbatim:
+          { "cameraIds": ["camera.front", ...] }  — capture ONLY these
+
+        The dashboard registers a camera id while its live view is open; the
+        cloud aggregates the currently-viewed set for this branch and hands it
+        back so HA captures only what someone is actually watching (usually 1,
+        often 0). An empty list means nobody is watching → capture nothing.
+
+        Raises LazyWaitAuthError on 401 (token rotated); LazyWaitApiError else.
+        """
+        url = self._url("/camera/snapshot/requests")
+        return await self._authed_request("GET", url)
+
+    async def post_snapshot(
+        self,
+        camera_id: str,
+        image_b64: str,
+        content_type: str = "image/jpeg",
+    ) -> dict[str, Any]:
+        """Upload one freshly-captured JPEG snapshot for a viewed camera.
+
+        POST /integrations/home-assistant/camera/snapshot (bearer-authed; branch
+        resolved cloud-side from the token). `image_b64` is the base64 of the raw
+        JPEG bytes with NO ``data:`` prefix. The cloud caches the latest frame
+        per (branch, camera) and serves it to the dashboard poll, giving a
+        near-live (~1 fps) view without WebRTC.
+
+        Returns { "ok": true }. Raises LazyWaitAuthError on 401; LazyWaitApiError
+        on other non-2xx (the caller swallows it — a dropped frame is fine).
+        """
+        url = self._url("/camera/snapshot")
+        body = {
+            "cameraId": camera_id,
+            "image": image_b64,
+            "contentType": content_type,
+        }
         return await self._authed_request("POST", url, json=body)
 
     async def report_cameras(

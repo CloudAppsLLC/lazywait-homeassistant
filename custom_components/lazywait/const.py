@@ -24,7 +24,15 @@ CONF_PAIRING_CODE = "pairing_code"
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 
 # Identifies this component build to the cloud /status heartbeat.
-INTEGRATION_VERSION = "26.7.1"
+INTEGRATION_VERSION = "26.7.2"
+
+# ── Near-live camera snapshot loop ──────────────────────────────────────────
+# A SEPARATE lightweight loop (not the 30s poll) captures a JPEG for each camera
+# the dashboard is viewing NOW and posts it, giving a ~1 fps near-live view
+# without WebRTC. ~1s cadence to feel live; concurrency capped to the (usually
+# single) camera actually being watched so it can't hammer the NVR.
+SNAPSHOT_LOOP_INTERVAL_SECONDS = 1.0
+SNAPSHOT_MAX_CONCURRENT = 2
 # Event types the component can emit to the cloud. Mirrors the cloud's
 # discriminated union (absence | presence | device_state).
 EVENT_ABSENCE = "absence"

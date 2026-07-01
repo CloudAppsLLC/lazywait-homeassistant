@@ -31,10 +31,13 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import LazyWaitApiClient, LazyWaitApiError, LazyWaitAuthError
 from .camera import Go2RtcTarget, answer_offer, list_cameras
+from .camerasnapshot import capture_snapshot, encode_snapshot
 from .const import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DOMAIN,
     INTEGRATION_VERSION,
+    SNAPSHOT_LOOP_INTERVAL_SECONDS,
+    SNAPSHOT_MAX_CONCURRENT,
 )
 from .mediarelay import MediaRelayManager
 
@@ -96,6 +99,11 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # push SRT to the cloud MediaMTX. Driven entirely by config.media_relay;
         # reconciled each cycle. Best-effort — never breaks the poll loop.
         self._media_relay = MediaRelayManager(hass)
+        # Near-live snapshot loop: a SEPARATE ~1s asyncio task (the 30s poll is
+        # far too slow to feel live). It polls which cameras the dashboard is
+        # viewing now and captures+posts a JPEG for each. Started in
+        # async_setup_entry, cancelled on unload alongside the media relay.
+        self._snapshot_task: asyncio.Task | None = None
 
     def attach_admin_socket(
         self, socket: LazyWaitAdminSocket, task: asyncio.Task
@@ -104,8 +112,20 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._admin_socket = socket
         self._admin_task = task
 
+    def start_snapshot_loop(self) -> None:
+        """Start the ~1s near-live snapshot loop (called from async_setup_entry).
+
+        Kept OUT of the 30s poll cycle deliberately: a still image refreshed once
+        every 30s isn't "live", so this runs on its own lightweight cadence. The
+        task swallows everything (see ``_snapshot_loop``); cancelled on unload in
+        ``shutdown_admin_socket`` alongside the admin socket + media relay.
+        """
+        if self._snapshot_task is not None:
+            return
+        self._snapshot_task = self.hass.loop.create_task(self._snapshot_loop())
+
     async def shutdown_admin_socket(self) -> None:
-        """Stop the admin socket task + media-relay pushers (on unload)."""
+        """Stop the admin socket task + snapshot loop + media-relay pushers (unload)."""
         if self._admin_socket is not None:
             await self._admin_socket.stop()
         if self._admin_task is not None:
@@ -116,8 +136,102 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pass
         self._admin_socket = None
         self._admin_task = None
+        # Cancel the near-live snapshot loop so it doesn't outlive the entry.
+        if self._snapshot_task is not None:
+            self._snapshot_task.cancel()
+            try:
+                await self._snapshot_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._snapshot_task = None
         # Tear down any running ffmpeg SRT pushers so they don't outlive the entry.
         await self._media_relay.stop_all()
+
+    async def _snapshot_loop(self) -> None:
+        """Near-live snapshot loop: poll viewed cameras, capture+post, ~1 fps.
+
+        Runs forever until cancelled. Each tick:
+          1. GET .../camera/snapshot/requests → the cameras being watched NOW
+             (usually 0 or 1; the dashboard registers a camera while its live
+             view is open).
+          2. For each viewed camera (capped by ``SNAPSHOT_MAX_CONCURRENT``),
+             capture a JPEG in-process and POST it.
+          3. Sleep ~1s.
+
+        This loop MUST NEVER raise out — a raised exception would kill the task
+        silently and stop the near-live view until the next reload. Every branch
+        (including the request poll and each capture/post) is wrapped so the loop
+        is self-healing: a transient error just skips a tick. Only
+        ``asyncio.CancelledError`` propagates, so unload can stop it cleanly.
+        """
+        while True:
+            try:
+                await self._snapshot_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - loop must never die
+                _LOGGER.debug("snapshot loop tick errored (ignored): %s", err)
+            try:
+                await asyncio.sleep(SNAPSHOT_LOOP_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+
+    async def _snapshot_tick(self) -> None:
+        """One snapshot cycle: fetch the viewed-camera list, capture+post each.
+
+        Isolated from the loop so the loop body stays a thin try/sleep. A dead
+        token surfaces nowhere here (the 30s poll already owns reauth); we just
+        skip the tick on any request failure so the near-live path never fights
+        the main coordinator over the reauth flow.
+        """
+        try:
+            resp = await self._client.snapshot_requests()
+        except LazyWaitApiError as err:
+            _LOGGER.debug("snapshot requests poll failed (ignored): %s", err)
+            return
+        except Exception as err:  # noqa: BLE001 - never break the loop
+            _LOGGER.debug("snapshot requests poll errored (ignored): %s", err)
+            return
+
+        camera_ids = resp.get("cameraIds") if isinstance(resp, dict) else None
+        if not isinstance(camera_ids, list) or not camera_ids:
+            return  # Nobody watching → capture nothing.
+
+        # Cap concurrency: only the cameras actually being viewed, and no more
+        # than SNAPSHOT_MAX_CONCURRENT at once (usually 1). Dedupe + keep order.
+        seen: set[str] = set()
+        targets: list[str] = []
+        for cid in camera_ids:
+            if isinstance(cid, str) and cid and cid not in seen:
+                seen.add(cid)
+                targets.append(cid)
+            if len(targets) >= SNAPSHOT_MAX_CONCURRENT:
+                break
+
+        await asyncio.gather(
+            *(self._capture_and_post(cid) for cid in targets)
+        )
+
+    async def _capture_and_post(self, camera_id: str) -> None:
+        """Capture one camera's current frame in-process and upload it.
+
+        Both capture and post are best-effort: ``capture_snapshot`` returns None
+        on any failure (never raises), and a failed post is swallowed. A dropped
+        frame is fine — the next tick (~1s later) tries again.
+        """
+        captured = await capture_snapshot(self.hass, camera_id)
+        if captured is None:
+            return
+        content, content_type = captured
+        try:
+            await self._client.post_snapshot(
+                camera_id, encode_snapshot(content), content_type
+            )
+            _LOGGER.debug("posted snapshot for %s (%s bytes)", camera_id, len(content))
+        except LazyWaitApiError as err:
+            _LOGGER.debug("snapshot post failed for %s (ignored): %s", camera_id, err)
+        except Exception as err:  # noqa: BLE001 - never break the loop
+            _LOGGER.debug("snapshot post errored for %s (ignored): %s", camera_id, err)
 
     @property
     def branch_id(self) -> str:

@@ -59,6 +59,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     admin_task = hass.loop.create_task(admin_socket.run())
     coordinator.attach_admin_socket(admin_socket, admin_task)
 
+    # Start the near-live camera snapshot loop (~1s): captures a JPEG for each
+    # camera the dashboard is viewing now and posts it. This is the SIMPLE
+    # near-live path replacing WebRTC. Isolated + best-effort; cancelled on
+    # unload inside shutdown_admin_socket alongside the admin socket.
+    coordinator.start_snapshot_loop()
+
     # Store the coordinator directly (unchanged contract for sensor /
     # binary_sensor / hikvision platforms).
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator

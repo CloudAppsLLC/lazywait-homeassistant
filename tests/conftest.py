@@ -39,3 +39,7 @@ _load("custom_components.lazywait.const", "const.py")
 _load("custom_components.lazywait.api", "api.py")
 # camera.py imports only aiohttp + stdlib (no homeassistant), so it loads HA-free.
 _load("custom_components.lazywait.camera", "camera.py")
+# camerasnapshot.py guards its homeassistant import behind TYPE_CHECKING (the
+# real async_get_image is imported lazily inside the function), so it loads
+# HA-free too — capture_snapshot degrades to None when the symbol is absent.
+_load("custom_components.lazywait.camerasnapshot", "camerasnapshot.py")

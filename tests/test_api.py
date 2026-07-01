@@ -266,3 +266,49 @@ async def test_push_events_sets_idempotency_key_header() -> None:
     assert kwargs["headers"]["Idempotency-Key"] == "k1"
     assert kwargs["headers"]["Authorization"] == "Bearer tok"
     assert kwargs["json"] == {"events": [{"type": "presence"}]}
+
+
+# ── Near-live snapshot relay ─────────────────────────────────────────────────
+
+
+async def test_snapshot_requests_gets_camera_ids() -> None:
+    session = _session_returning(
+        _FakeResponse(200, {"cameraIds": ["camera.front", "camera.back"]})
+    )
+    client = LazyWaitApiClient(BASE, session, token="tok")
+
+    result = await client.snapshot_requests()
+
+    assert result == {"cameraIds": ["camera.front", "camera.back"]}
+    args, kwargs = session.request.call_args
+    assert args[0] == "GET"
+    assert args[1] == f"{BASE}{PREFIX}/camera/snapshot/requests"
+    assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+async def test_post_snapshot_body_and_url() -> None:
+    session = _session_returning(_FakeResponse(200, {"ok": True}))
+    client = LazyWaitApiClient(BASE, session, token="tok")
+
+    result = await client.post_snapshot("camera.front", "Zm9v", "image/jpeg")
+
+    assert result == {"ok": True}
+    args, kwargs = session.request.call_args
+    assert args[0] == "POST"
+    assert args[1] == f"{BASE}{PREFIX}/camera/snapshot"
+    assert kwargs["json"] == {
+        "cameraId": "camera.front",
+        "image": "Zm9v",
+        "contentType": "image/jpeg",
+    }
+    assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+async def test_post_snapshot_defaults_content_type_jpeg() -> None:
+    session = _session_returning(_FakeResponse(200, {"ok": True}))
+    client = LazyWaitApiClient(BASE, session, token="tok")
+
+    await client.post_snapshot("camera.front", "Zm9v")
+
+    _, kwargs = session.request.call_args
+    assert kwargs["json"]["contentType"] == "image/jpeg"
