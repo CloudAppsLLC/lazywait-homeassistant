@@ -11,10 +11,12 @@ the pushing. For each camera the cloud enabled, this module:
      PUSHES it as SRT to the cloud MediaMTX with ``-c copy`` — NO transcode, so
      it's cheap (no CPU-heavy re-encode on the branch box).
 
-The exact push command:
+The exact push command (``<streamId>`` is the COMPLETE streamid the cloud
+composed — ``publish:tenant-<client>/camera-<id>:passphrase:<token>`` — passed
+verbatim; the passphrase is already inside it, so nothing is appended):
 
     ffmpeg -rtsp_transport tcp -i <rtsp> -c copy -f mpegts \
-      'srt://<host>:<port>?streamid=publish:tenant-<client>/camera-<id>&passphrase=<token>'
+      'srt://<host>:<port>?streamid=<streamId>'
 
 MediaMTX on the VPS accepts that SRT publish on the path
 ``tenant-<client>/camera-<id>`` (passthrough — MediaMTX does not re-encode
@@ -22,22 +24,26 @@ either) and the dashboard plays HLS (Caddy TLS proxy) or WebRTC-WHEP from
 MediaMTX. The SAME dashboard ``<video>`` is fed to the in-browser face
 recognizer — recognition never runs here.
 
-Cloud drives WHICH cameras + endpoint + per-stream token via the existing
-``/config`` poll's ``media_relay`` block::
+Cloud drives WHICH cameras + endpoint + per-stream streamid via the existing
+``/config`` poll's ``mediaRelay`` block (camelCase — this is the exact shape
+``HaConfigService.buildMediaRelay`` emits on the cloud)::
 
-    config.media_relay = {
-      "srtHost": "media.example.com",
-      "srtPort": 8890,
-      "streams": [
-        {"cameraId": "camera.front_door", "streamId": "tenant-abc/camera-1",
-         "passphrase": "…"},
+    config.mediaRelay = {
+      "srtHost": "media.example.com:8890",   # host:port as ONE string
+      "passphrase": "…",                      # branch media-relay token (raw)
+      "cameras": [
+        {"cameraId": "camera.front_door",
+         "path": "tenant-abc/camera-1",
+         "streamId": "publish:tenant-abc/camera-1:passphrase:…"},
         …
       ]
     }
 
 ``cameraId`` is the HA ``camera.*`` entity id (used to resolve the RTSP source);
-``streamId`` is the MediaMTX path the cloud minted; ``passphrase`` is the
-per-stream SRT token.
+``streamId`` is the COMPLETE SRT streamid the cloud already composed
+(``publish:<path>:passphrase:<token>``) — we pass it to ffmpeg VERBATIM as
+``streamid=<streamId>`` and never reconstruct it. ``srtHost`` carries the port
+inline (``host:port``); we split it once when building the SRT URL.
 
 Everything here is BEST-EFFORT: a failed RTSP resolve, a missing ffmpeg binary,
 or a crashed pusher is logged and swallowed — the media relay must NEVER break
@@ -63,6 +69,16 @@ _STARTUP_GRACE_SECONDS = 1.5
 # a tight loop. The next reconcile cycle (~30s) is the natural retry cadence.
 _RESTART_MIN_INTERVAL_SECONDS = 10.0
 
+# Hard ceiling on simultaneous ffmpeg SRT pushers. Each push is a remux (cheap
+# CPU, `-c copy`) but still one subprocess + one outbound SRT connection + the
+# NVR's per-channel RTSP session, so a 16-channel NVR pushing all at once would
+# saturate the branch's uplink and the NVR's connection budget. The cloud SHOULD
+# only send the actively-viewed camera(s) in mediaRelay.cameras, but cap here as
+# defense-in-depth so a misconfigured/over-broad config can't fan out. Mirrors
+# the snapshot loop's SNAPSHOT_MAX_CONCURRENT. Cameras beyond the cap are dropped
+# (logged once) — the viewed/main camera should always be within the first few.
+_MAX_CONCURRENT_PUSHERS = 4
+
 
 class _Pusher:
     """One ffmpeg subprocess pushing a single camera's RTSP out as SRT.
@@ -76,15 +92,15 @@ class _Pusher:
         self,
         camera_id: str,
         stream_id: str,
-        passphrase: str,
         srt_host: str,
-        srt_port: int,
     ) -> None:
         self.camera_id = camera_id
+        # The COMPLETE MediaMTX streamid the cloud composed — used verbatim as
+        # ffmpeg's `streamid=`. Already `publish:<path>:passphrase:<token>`; we
+        # must NOT re-prefix `publish:` or re-append `&passphrase=`.
         self.stream_id = stream_id
-        self.passphrase = passphrase
+        # `host:port` as a single string (cloud ships env.media.srtHost inline).
         self.srt_host = srt_host
-        self.srt_port = srt_port
         self._proc: asyncio.subprocess.Process | None = None
         self._rtsp: str | None = None
         # Monotonic timestamp of the last spawn; gates the restart floor.
@@ -95,34 +111,30 @@ class _Pusher:
         """True while the ffmpeg subprocess is alive (returncode still None)."""
         return self._proc is not None and self._proc.returncode is None
 
-    def desired_key(self) -> tuple[str, str, str, str, int]:
+    def desired_key(self) -> tuple[str, str, str]:
         """Identity used to detect config drift (a change → restart).
 
-        If the cloud rotates the passphrase, moves the SRT host/port, or repoints
-        the streamId, the key changes and reconcile tears down + respawns.
+        If the cloud rotates the token (embedded in streamId), moves the SRT
+        host/port, or repoints the streamId, the key changes and reconcile tears
+        down + respawns. The streamId already encodes the path + passphrase, so
+        it alone captures a token rotation.
         """
         return (
             self.camera_id,
             self.stream_id,
-            self.passphrase,
             self.srt_host,
-            self.srt_port,
         )
 
     def _build_srt_url(self) -> str:
         """The SRT publish URL for this stream.
 
-        ``streamid=publish:<path>`` is MediaMTX's convention for a publisher on
-        ``<path>``; ``passphrase`` is the per-stream SRT encryption key the cloud
-        minted. The whole URL is one argv element (no shell), so the ``&`` needs
-        no quoting/escaping here — that quoting only matters in the shell form
-        shown in the module docstring.
+        The cloud already composed the full ``streamid`` (``publish:<path>:
+        passphrase:<token>``), so we pass it VERBATIM — no `publish:` prefix, no
+        `&passphrase=` suffix to add here. ``srt_host`` carries `host:port`
+        inline. The whole URL is one argv element (no shell), so `?`/`&`/`:` in
+        the streamid need no quoting.
         """
-        return (
-            f"srt://{self.srt_host}:{self.srt_port}"
-            f"?streamid=publish:{self.stream_id}"
-            f"&passphrase={self.passphrase}"
-        )
+        return f"srt://{self.srt_host}?streamid={self.stream_id}"
 
     def _build_ffmpeg_args(self, rtsp_url: str) -> list[str]:
         """The ffmpeg argv. ``-c copy`` = remux only, NO transcode (cheap).
@@ -201,13 +213,13 @@ class _Pusher:
             )
         except asyncio.TimeoutError:
             # Still alive after the grace window → treat as running (the healthy
-            # path). log the SRT target (NOT the passphrase) for observability.
+            # path). Log the SRT host + camera (NOT the streamid — it embeds the
+            # passphrase) for observability.
             _LOGGER.info(
-                "media relay: pushing %s → srt://%s:%s (%s)",
+                "media relay: pushing %s → srt://%s (path %s)",
                 self.camera_id,
                 self.srt_host,
-                self.srt_port,
-                self.stream_id,
+                self.camera_id,
             )
             return True
 
@@ -307,53 +319,53 @@ async def _resolve_rtsp_source(hass: Any, camera_id: str) -> str | None:
 
 def _parse_media_relay_config(
     media_relay: Any,
-) -> tuple[str, int, list[dict[str, str]]]:
-    """Validate + normalize ``config.media_relay`` into (host, port, streams).
+) -> tuple[str, list[dict[str, str]]]:
+    """Validate + normalize the cloud ``mediaRelay`` block into (host, cameras).
 
-    Returns ``("", 0, [])`` when the block is absent/malformed (relay disabled).
-    Each returned stream is a dict with non-empty ``cameraId``, ``streamId``,
-    ``passphrase``. Streams missing any field are dropped (logged at debug).
+    Matches the EXACT shape ``HaConfigService.buildMediaRelay`` emits:
+      { srtHost: "host:port", passphrase: str, cameras: [{cameraId, path, streamId}] }
+    ``srtHost`` carries the port inline; ``streamId`` is the complete SRT streamid
+    (``publish:<path>:passphrase:<token>``). We pass streamId to ffmpeg verbatim,
+    so ``passphrase`` at the top level is not needed here (it's embedded in each
+    streamId already).
+
+    Returns ``("", [])`` when the block is absent/malformed (relay disabled).
+    Each returned camera has non-empty ``cameraId`` + ``streamId``; entries
+    missing either are dropped (logged at debug).
     """
     if not isinstance(media_relay, dict):
-        return "", 0, []
+        return "", []
 
     srt_host = media_relay.get("srtHost")
-    srt_port = media_relay.get("srtPort")
     if not isinstance(srt_host, str) or not srt_host.strip():
-        return "", 0, []
-    if not isinstance(srt_port, int) or srt_port <= 0:
-        return "", 0, []
+        return "", []
 
-    raw_streams = media_relay.get("streams")
-    if not isinstance(raw_streams, list):
-        return "", 0, []
+    raw_cameras = media_relay.get("cameras")
+    if not isinstance(raw_cameras, list):
+        return "", []
 
-    streams: list[dict[str, str]] = []
-    for item in raw_streams:
+    cameras: list[dict[str, str]] = []
+    for item in raw_cameras:
         if not isinstance(item, dict):
             continue
         camera_id = item.get("cameraId")
         stream_id = item.get("streamId")
-        passphrase = item.get("passphrase")
         if not (
             isinstance(camera_id, str)
             and camera_id.strip()
             and isinstance(stream_id, str)
             and stream_id.strip()
-            and isinstance(passphrase, str)
-            and passphrase.strip()
         ):
-            _LOGGER.debug("media relay: dropping malformed stream entry: %s", item)
+            _LOGGER.debug("media relay: dropping malformed camera entry: %s", item)
             continue
-        streams.append(
+        cameras.append(
             {
                 "cameraId": camera_id.strip(),
                 "streamId": stream_id.strip(),
-                "passphrase": passphrase,
             }
         )
 
-    return srt_host.strip(), srt_port, streams
+    return srt_host.strip(), cameras
 
 
 class MediaRelayManager:
@@ -384,14 +396,29 @@ class MediaRelayManager:
             _LOGGER.debug("media relay reconcile errored (ignored): %s", err)
 
     async def _reconcile_locked(self, media_relay: Any) -> None:
-        srt_host, srt_port, streams = _parse_media_relay_config(media_relay)
+        srt_host, cameras = _parse_media_relay_config(media_relay)
 
-        # Relay disabled or no valid streams → stop everything.
-        if not streams:
+        # Relay disabled or no valid cameras → stop everything.
+        if not cameras:
             if self._pushers:
-                _LOGGER.info("media relay: no streams in config; stopping all pushers")
+                _LOGGER.info("media relay: no cameras in config; stopping all pushers")
                 await self.stop_all()
             return
+
+        # Defense-in-depth concurrency cap: never run more than
+        # _MAX_CONCURRENT_PUSHERS ffmpeg pushes even if the cloud sends more (it
+        # should only send the viewed set). Keep the FIRST N (the cloud lists the
+        # main/viewed camera first). Log the drop once per over-broad cycle so a
+        # misconfig is visible rather than silently truncated.
+        if len(cameras) > _MAX_CONCURRENT_PUSHERS:
+            _LOGGER.warning(
+                "media relay: config has %s cameras; capping to %s (dropping %s). "
+                "The cloud should send only the viewed camera(s).",
+                len(cameras),
+                _MAX_CONCURRENT_PUSHERS,
+                len(cameras) - _MAX_CONCURRENT_PUSHERS,
+            )
+            cameras = cameras[:_MAX_CONCURRENT_PUSHERS]
 
         # A missing ffmpeg binary makes every start fail — check once and bail
         # loudly rather than spawn-failing per camera every cycle.
@@ -400,20 +427,18 @@ class MediaRelayManager:
                 _LOGGER.error(
                     "media relay: ffmpeg not installed in this image; %s stream(s) "
                     "cannot be relayed. The add-on Dockerfile must `apk add ffmpeg`.",
-                    len(streams),
+                    len(cameras),
                 )
                 self._ffmpeg_missing_logged = True
             return
         self._ffmpeg_missing_logged = False
 
         desired: dict[str, _Pusher] = {}
-        for s in streams:
+        for s in cameras:
             desired[s["cameraId"]] = _Pusher(
                 camera_id=s["cameraId"],
                 stream_id=s["streamId"],
-                passphrase=s["passphrase"],
                 srt_host=srt_host,
-                srt_port=srt_port,
             )
 
         # 1) Stop pushers no longer desired, or whose config drifted.

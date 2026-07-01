@@ -365,7 +365,9 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # cloud's media_relay directive (start enabled cameras, stop removed
             # ones, restart dead ones). Best-effort and isolated inside the
             # manager — never fails this cycle.
-            await self._media_relay.reconcile(config.get("media_relay"))
+            # Cloud ships the block under camelCase `mediaRelay` (the exact key
+            # HaConfigService.getConfig sets); read that, not snake_case.
+            await self._media_relay.reconcile(config.get("mediaRelay"))
 
             return config
         except LazyWaitAuthError as err:
