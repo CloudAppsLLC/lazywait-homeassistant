@@ -447,10 +447,20 @@ class MediaRelayManager:
             async with self._lock:
                 await self._reconcile_locked(media_relay)
         except Exception as err:  # noqa: BLE001 - relay must never break the loop
-            _LOGGER.debug("media relay reconcile errored (ignored): %s", err)
+            _LOGGER.warning(
+                "media relay reconcile errored (ignored): %s", err, exc_info=True
+            )
 
     async def _reconcile_locked(self, media_relay: Any) -> None:
         srt_host, cameras = _parse_media_relay_config(media_relay)
+        # Prove reconcile is reached + what it parsed. INFO so it survives the
+        # default log level (a DEBUG line here was invisible while we chased why
+        # nothing published). One line/cycle; cheap.
+        _LOGGER.info(
+            "media relay: reconcile host=%s cameras=%s",
+            srt_host or "(none)",
+            [c["cameraId"] for c in cameras],
+        )
 
         # Relay disabled or no valid cameras → stop everything.
         if not cameras:
