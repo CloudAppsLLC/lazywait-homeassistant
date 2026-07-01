@@ -105,6 +105,9 @@ class _Pusher:
         self._rtsp: str | None = None
         # Monotonic timestamp of the last spawn; gates the restart floor.
         self._last_start = 0.0
+        # Background task draining ffmpeg stderr on the healthy path so the PIPE
+        # buffer can't fill and block the process. Cancelled on stop().
+        self._drain_task: asyncio.Task | None = None
 
     @property
     def is_running(self) -> bool:
@@ -184,7 +187,12 @@ class _Pusher:
                 *args,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                # PIPE (not DEVNULL) so that when ffmpeg exits immediately we can
+                # log its stderr tail — the actual reason (RTSP timeout / auth,
+                # SRT connection refused / bad passphrase, codec) instead of an
+                # opaque rc. On the healthy path the process stays up and we don't
+                # read the pipe (a warning-level -loglevel keeps it low-volume).
+                stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
             # ffmpeg not in the image/PATH — the add-on Dockerfile must `apk add
@@ -213,7 +221,13 @@ class _Pusher:
             )
         except asyncio.TimeoutError:
             # Still alive after the grace window → treat as running (the healthy
-            # path). Log the SRT host + camera (NOT the streamid — it embeds the
+            # path). Drain stderr in the background so the PIPE buffer can't fill
+            # and block ffmpeg on a long-lived push (OS pipe buffer ~64KB; even at
+            # -loglevel warning a multi-hour stream could otherwise stall). Fire-
+            # and-forget; it ends when the process closes the pipe on exit.
+            if self._proc.stderr is not None:
+                self._drain_task = asyncio.ensure_future(self._drain_stderr())
+            # Log the SRT host + camera (NOT the streamid — it embeds the
             # passphrase) for observability.
             _LOGGER.info(
                 "media relay: pushing %s → srt://%s (path %s)",
@@ -223,16 +237,56 @@ class _Pusher:
             )
             return True
 
-        # Exited within the grace window → failed to start.
+        # Exited within the grace window → failed to start. Surface ffmpeg's
+        # stderr tail so the REASON is visible (rc alone is opaque: rc=8 could be
+        # a dead RTSP source, an SRT connection refused, a rejected passphrase,
+        # or a codec mismatch). Read the buffered stderr (process already exited,
+        # so this returns promptly); log the last ~500 chars.
+        stderr_tail = ""
+        try:
+            if self._proc.stderr is not None:
+                raw = await self._proc.stderr.read()
+                stderr_tail = raw.decode("utf-8", "replace").strip()[-500:]
+        except Exception:  # noqa: BLE001 - diagnostics must never break the loop
+            stderr_tail = "(stderr unavailable)"
         _LOGGER.warning(
-            "media relay: ffmpeg for %s exited immediately (rc=%s); will retry",
+            "media relay: ffmpeg for %s exited immediately (rc=%s); will retry. "
+            "ffmpeg: %s",
             self.camera_id,
             self._proc.returncode,
+            stderr_tail or "(no stderr)",
         )
         return False
 
+    async def _drain_stderr(self) -> None:
+        """Continuously consume ffmpeg stderr on the healthy path so the OS pipe
+        buffer can't fill and stall the process. Ends when ffmpeg closes the pipe
+        (on exit). Best-effort; never raises."""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break  # EOF — process exited / pipe closed
+                # ffmpeg -loglevel warning: only real problems reach here. Log at
+                # debug so a healthy stream stays quiet but issues are diagnosable.
+                _LOGGER.debug(
+                    "media relay ffmpeg[%s]: %s",
+                    self.camera_id,
+                    line.decode("utf-8", "replace").rstrip(),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - draining must never break anything
+            return
+
     async def stop(self) -> None:
         """Terminate the ffmpeg subprocess. Best-effort; never raises."""
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            self._drain_task = None
         proc = self._proc
         self._proc = None
         if proc is None or proc.returncode is not None:
