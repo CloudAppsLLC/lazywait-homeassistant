@@ -190,64 +190,88 @@ replaced.
 
 ---
 
-## Live camera view
+## Live camera view (streaming)
 
-The dashboard can open a **live WebRTC view** of a branch camera, streamed
-straight from the camera to the browser — the LazyWait cloud only relays the
-handshake, never the video.
+The dashboard can open a **live video stream** of a branch camera. Home Assistant
+pushes the camera's RTSP feed **outbound** over **SRT** to the LazyWait media
+relay (a central MediaMTX server), which serves it to the dashboard as **HLS**.
+Home Assistant stays **outbound-only** — no inbound port-forwarding, no public IP
+on the branch.
 
-**How it works (WebRTC, NAT-friendly):**
+```
+Branch NVR/camera (RTSP, LAN)
+  → HA add-on ffmpeg  ──SRT (outbound, UDP)──►  LazyWait media relay (MediaMTX, cloud)
+                                                   → HLS over HTTPS ──►  Dashboard <video>
+```
 
-1. In the dashboard, an admin opens a branch camera. The browser creates a
-   WebRTC **offer** (an SDP blob with its ICE candidates bundled in) and POSTs
-   it to the cloud, which returns a `sessionId` and **Twilio TURN** credentials
-   (the same TURN service screen-share uses — reused for NAT traversal).
-2. Home Assistant is **outbound-only** behind NAT, so it can't accept an inbound
-   connection. Instead, on each poll cycle the integration **polls** the cloud
-   for a pending offer for its branch.
-3. When an offer is pending, HA asks its **bundled go2rtc** to produce an
-   **answer** for that offer against the requested camera stream, and POSTs the
-   answer back to the cloud.
-4. The dashboard polls for the answer, applies it, and the browser and go2rtc
-   connect **peer-to-peer** over Twilio TURN. **Video never touches the cloud** —
-   only the SDP offer/answer does.
+**Why SRT (not WebRTC).** The earlier WebRTC/go2rtc path was replaced: it needed
+TURN relays and per-release go2rtc quirks. SRT is a single outbound UDP push that
+traverses NAT cleanly and needs no signaling round-trip. The video is relayed
+through the cloud MediaMTX, but every read is authorized by a short-TTL,
+camera-scoped token — the raw stream is never public.
 
-**Cameras are auto-discovered.** You don't list them anywhere. On each poll cycle
-(throttled to ~once every 30s) the integration discovers cameras two ways and
-merges them: (1) the local go2rtc streams (`GET /api/streams`), and (2) every HA
-`camera.*` entity read **directly from the in-process Home Assistant state
-machine** — no token, no HTTP. The combined list is **reported outbound** to the
-cloud, which caches it and serves it to the dashboard picker. Each camera is
-`{ id, name, online }` where `id` is the `camera.*` entity_id (which HA also
-registers with go2rtc as the stream `src`) — the dashboard hands that `id`
-straight back as `cameraId` when it opens a stream. Discovery is best-effort: if
-both sources come up empty the live view degrades gracefully.
+**What runs where — and what a NEW branch needs to do:**
 
-**Hikvision / NVR channels work out of the box.** NVR channel cameras are *not*
-auto-published as go2rtc streams, so the go2rtc list alone misses them. The
-in-process `camera.*` enumeration picks them up automatically — **no `go2rtc.yaml`
-entry is required**. Just add the camera/NVR channels to HA as `camera.*` entities
-(Generic Camera / ONVIF) and they appear in the dashboard picker on the next poll.
+The good news for a fresh install: **there is nothing to configure on the Home
+Assistant / Pi side beyond adding your cameras.** All relay settings (which
+central server to push to, credentials, ports) are delivered to the add-on
+automatically by the LazyWait cloud in the branch config it already polls.
 
-**What you need:**
+1. **Add your cameras to HA as `camera.*` entities** (Generic Camera / ONVIF /
+   Hikvision), exactly as for Face attendance above. Hikvision **NVR channels**
+   are picked up automatically from the in-process HA state machine — no
+   `go2rtc.yaml` entry needed. The integration reports the camera list outbound
+   on each poll; they appear in the dashboard picker within ~30s.
+2. **Enable streaming for the branch from the dashboard** (Face Check-ins → the
+   *Enable stream* button, or the tenant's camera settings). This flips
+   `media_cameras_enabled` on and provisions a per-branch relay token
+   server-side. The add-on receives it in its next config poll and starts pushing
+   **only the camera(s) currently being viewed** in the dashboard (idle cameras
+   cost nothing — no push runs until someone watches).
+3. That's it. The add-on's ffmpeg resolves each viewed camera's RTSP source and
+   pushes it over SRT to the relay; the dashboard plays the HLS.
 
-- Add your cameras to HA as `camera.*` entities — that alone is enough for them to
-  be discovered and appear in the picker (Hikvision NVR channels included).
-- go2rtc is bundled in modern Home Assistant; HA registers `camera.*` entities
-  with go2rtc automatically. You can optionally name streams in `go2rtc.yaml`. The
-  dashboard's `cameraId` maps to the go2rtc `src` stream name (empty → the
-  integration's default stream).
-- No inbound port-forwarding. HA stays outbound-only; the cloud is the rendezvous
-  for signaling and Twilio handles media relay.
+**Requirements / notes:**
 
-**go2rtc handshake note:** the integration tries the standalone go2rtc API
-(`POST http://127.0.0.1:1984/api/webrtc?src=<stream>`) and the HA-proxied form
-(`POST /api/go2rtc/webrtc?src=<stream>`), using the first that returns an SDP
-answer. The exact go2rtc WebRTC route varies between go2rtc releases — if neither
-answers, the integration logs **"go2rtc handshake unconfirmed"** with what it
-tried, and the stream falls back gracefully rather than failing the poll loop.
-See `custom_components/lazywait/camera.py` for the one call to verify against your
-HA build's go2rtc.
+- **ffmpeg** must be present in the add-on image (the add-on Dockerfile installs
+  it). The integration logs a one-time error if it's missing.
+- **Cameras must expose RTSP** reachable from the HA box (the usual Hikvision
+  form `rtsp://<user>:<pass>@<nvr-host>:554/Streaming/Channels/<channel>01` for
+  the main stream). Confirm it plays in VLC before expecting a stream.
+  ⚠️ **URL-encode special characters in the password** — e.g. `#` → `%23`
+  (`LW#12345` → `LW%2312345`), or ffmpeg silently fails to open the source.
+- **Codec:** cameras should output **H.264** for the main stream. HLS via MediaMTX
+  does not transmux H.265/HEVC for browser playback — set the streamed channel to
+  H.264 on the NVR if the tile stays blank.
+- **Concurrency:** the add-on pushes at most a small number of cameras at once
+  (the recently-viewed set) to protect the branch uplink and the NVR's session
+  budget. Switching the dashboard's main camera warms the new one on demand.
+- **No inbound ports on the branch.** SRT is an outbound caller connection; only
+  the central relay opens its ingest port. Nothing to open on the branch router.
+
+**Operator infrastructure (LazyWait / white-label partner only — NOT per-branch):**
+the central MediaMTX relay + reverse proxy are deployed once and shared by all
+tenants. Its setup lives in the `LazyWaitInternalAPI` repo under `deploy/media/`
+and `deploy/vps/` (MediaMTX config, docker-compose, Caddy routes, the SRT ingest
+port, and the HLS CDN secret that disables the cookie redirect). A branch device
+never touches any of this — it only pushes to the host the cloud tells it to.
+
+**Troubleshooting a blank tile:**
+
+- Check the add-on log for `media relay:` lines
+  (`ha core logs 2>&1 | grep -i "media relay"`). `pushing … → srt://…` then
+  `is publishing` means the push works — the problem is downstream (token/codec).
+  `Error opening input … 404` means the RTSP path/channel is wrong or the camera
+  is offline (or an empty NVR slot). A `DESCRIBE 404` on a channel that has no
+  camera is expected — that slot is empty.
+- Enable debug logging to see relay detail: add to `configuration.yaml`
+  ```yaml
+  logger:
+    default: warning
+    logs:
+      custom_components.lazywait: debug
+  ```
+  then restart HA.
 
 ---
 
@@ -262,9 +286,15 @@ All under the configured base URL + `/integrations/home-assistant`:
 | POST | `/events` | bearer | push a batch of events (Idempotency-Key) |
 | GET | `/ping` | bearer | liveness + token check |
 | POST | `/status` | bearer | self-reported health heartbeat |
-| GET | `/camera/poll` | bearer | claim a pending live-camera WebRTC offer |
-| POST | `/camera/answer` | bearer | return the SDP answer for a session |
 | POST | `/camera/cameras` | bearer | report the auto-discovered camera list |
+| POST | `/camera/snapshot` | bearer | push an on-demand JPEG for a viewed camera (thumbnails) |
+| GET | `/camera/snapshot/requests` | bearer | which cameras the dashboard is viewing now (drives snapshots) |
+
+The live-video **relay settings** are delivered inside the `GET /config` response
+(a `mediaRelay` block: the SRT host, per-branch passphrase, and the currently-
+viewed cameras to push). The add-on does not call a separate endpoint to stream —
+it reconciles its ffmpeg SRT pushers to that block on each config poll. The
+legacy `/camera/poll` + `/camera/answer` WebRTC-signaling endpoints are retired.
 
 The bearer is the token minted by `/pair`. The cloud resolves your branch from
 the token — Home Assistant never sends the branch id in a request body.

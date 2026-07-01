@@ -77,7 +77,10 @@ _RESTART_MIN_INTERVAL_SECONDS = 10.0
 # defense-in-depth so a misconfigured/over-broad config can't fan out. Mirrors
 # the snapshot loop's SNAPSHOT_MAX_CONCURRENT. Cameras beyond the cap are dropped
 # (logged once) — the viewed/main camera should always be within the first few.
-_MAX_CONCURRENT_PUSHERS = 4
+# Keep this === the cloud's MEDIA_RELAY_MAX_CAMERAS (configService.ts). Raised
+# 4→8 so the recently-viewed set (pre-warm-on-hover + keep-warm TTL) stays warm
+# and switching cameras is instant rather than a cold ~8s SRT+HLS warm-up each.
+_MAX_CONCURRENT_PUSHERS = 8
 
 
 class _Pusher:
