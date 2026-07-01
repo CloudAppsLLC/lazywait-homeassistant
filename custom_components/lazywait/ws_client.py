@@ -21,6 +21,7 @@ reconnect storm; any other drop reconnects with exponential backoff + jitter.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import logging
 import random
@@ -39,6 +40,30 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _json_default(obj: Any) -> Any:
+    """json.dumps fallback for values HA embeds that aren't natively JSON.
+
+    HA entity attributes + automation configs carry datetime/date/time objects
+    (e.g. automation `last_triggered`, sensor timestamps). Plain json.dumps raises
+    'Object of type datetime is not JSON serializable', which was crashing the
+    admin WS on EVERY connect at _send_full_snapshot → the control socket never
+    stayed up. Serialize temporal types as ISO strings and anything else as its
+    string form so a stray unexpected type can never take the socket down."""
+    if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
+        return obj.isoformat()
+    if isinstance(obj, _dt.timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
+
+
+def _dumps(payload: Any) -> str:
+    """json.dumps that never raises on HA's datetime-bearing payloads."""
+    return json.dumps(payload, default=_json_default)
+
 
 # aiohttp WS heartbeat (seconds) — auto-answers the cloud's 25s WS ping and
 # detects a half-open socket.
@@ -155,7 +180,7 @@ class LazyWaitAdminSocket:
         except Exception:  # noqa: BLE001
             split = False
         await ws.send_str(
-            json.dumps(
+            _dumps(
                 {
                     "v": 1,
                     "type": "hello",
@@ -177,7 +202,7 @@ class LazyWaitAdminSocket:
 
         entities = control.build_state_snapshot(self._hass)
         await ws.send_str(
-            json.dumps(
+            _dumps(
                 {
                     "v": 1,
                     "type": "state_snapshot",
@@ -211,11 +236,11 @@ class LazyWaitAdminSocket:
             return
         # Cheap receipt so the dashboard can show "sent".
         await ws.send_str(
-            json.dumps({"v": 1, "type": "ack", "commandId": command_id})
+            _dumps({"v": 1, "type": "ack", "commandId": command_id})
         )
         result = await self._execute(frame)
         await ws.send_str(
-            json.dumps(
+            _dumps(
                 {
                     "v": 1,
                     "type": "command_result",
