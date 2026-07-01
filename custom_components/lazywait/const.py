@@ -36,7 +36,12 @@ INTEGRATION_VERSION = "26.7.3"
 # work time. 0.4s targets ~2.5 fps; the real ceiling is the NVR still-grab cost
 # (each tick pulls a fresh keyframe), so this is an upper bound, not a promise.
 SNAPSHOT_LOOP_INTERVAL_SECONDS = 0.4
-SNAPSHOT_MAX_CONCURRENT = 2
+# Cameras captured per tick. In the grid, 1 slot goes to the MAIN (primary)
+# camera every tick and the rest round-robin the thumbnail (secondary) set, so
+# with 3 the main stays fast while 2 thumbnails refresh per tick (an 11-camera
+# grid cycles every ~2s). Bounded low on purpose — each capture is a fresh NVR
+# still-grab, so this caps the load a cheap NVR sees.
+SNAPSHOT_MAX_CONCURRENT = 3
 # Event types the component can emit to the cloud. Mirrors the cloud's
 # discriminated union (absence | presence | device_state).
 EVENT_ABSENCE = "absence"

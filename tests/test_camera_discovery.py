@@ -9,7 +9,10 @@ shape of a HA `State` (`.entity_id`, `.attributes`, `.state`) and a `hass`
 object exposing `states.async_all`.
 """
 
-from custom_components.lazywait.camera import list_from_hass_states
+from custom_components.lazywait.camera import (
+    _gate_online_by_stream_source,
+    list_from_hass_states,
+)
 
 
 class _FakeState:
@@ -97,3 +100,16 @@ def test_state_machine_error_returns_empty() -> None:
         states = _BoomStates()
 
     assert list_from_hass_states(_BoomHass()) == []
+
+
+async def test_stream_source_gate_keeps_flags_when_ha_api_absent() -> None:
+    # In this bare (HA-free) env the lazy `async_get_stream_source` import fails,
+    # so the gate must degrade to leaving the prior online flags untouched — a
+    # probe outage must never blank the picker. This is the exact fallback the
+    # real add-on hits if the HA symbol ever moves.
+    cameras = [
+        {"id": "camera.a", "name": "A", "online": True},
+        {"id": "camera.b", "name": "B", "online": False},
+    ]
+    gated = await _gate_online_by_stream_source(_FakeHass([]), cameras)
+    assert gated == cameras

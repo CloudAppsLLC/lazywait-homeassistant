@@ -57,6 +57,23 @@ _MAX_BUFFER = 1000
 _CAMERA_REPORT_INTERVAL_SECONDS = 30
 
 
+def _clean_ids(value: Any) -> list[str]:
+    """Coerce a snapshot-requests field into a deduped list of camera ids.
+
+    Accepts anything (the cloud response is untrusted): non-lists → ``[]``,
+    non-string / empty / duplicate entries dropped, first-seen order preserved.
+    """
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for cid in value:
+        if isinstance(cid, str) and cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
 class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Owns the cloud poll/push loop for one branch."""
 
@@ -104,6 +121,10 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # viewing now and captures+posts a JPEG for each. Started in
         # async_setup_entry, cancelled on unload alongside the media relay.
         self._snapshot_task: asyncio.Task | None = None
+        # Round-robin offset into the secondary (thumbnail) camera set, so a grid
+        # with more thumbnails than the per-tick concurrency budget still refreshes
+        # every channel over successive ticks instead of starving the tail.
+        self._snapshot_rr_offset = 0
 
     def attach_admin_socket(
         self, socket: LazyWaitAdminSocket, task: asyncio.Task
@@ -204,23 +225,42 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("snapshot requests poll errored (ignored): %s", err)
             return
 
-        camera_ids = resp.get("cameraIds") if isinstance(resp, dict) else None
-        if not isinstance(camera_ids, list) or not camera_ids:
+        if not isinstance(resp, dict):
+            return
+
+        # The cloud splits viewed cameras into `primary` (the grid MAIN — capture
+        # every tick so it stays fast) and `secondary` (thumbnail tiles — fine to
+        # round-robin). Fall back to the flat `cameraIds` list when talking to an
+        # older cloud that predates the split (all treated as primary then).
+        primary = _clean_ids(resp.get("primary"))
+        secondary = _clean_ids(resp.get("secondary"))
+        if not primary and not secondary:
+            primary = _clean_ids(resp.get("cameraIds"))
+        if not primary and not secondary:
             return  # Nobody watching → capture nothing.
 
-        # Cap concurrency: only the cameras actually being viewed, and no more
-        # than SNAPSHOT_MAX_CONCURRENT at once (usually 1). Dedupe + keep order.
+        # Every primary camera captures this tick; the remaining concurrency
+        # budget round-robins through the secondary (thumbnail) set so a large
+        # grid refreshes every channel over successive ticks instead of only ever
+        # capturing the first few. A thumbnail tolerates a few seconds of
+        # staleness, which is exactly what round-robin delivers.
+        targets: list[str] = list(primary[:SNAPSHOT_MAX_CONCURRENT])
+        budget = SNAPSHOT_MAX_CONCURRENT - len(targets)
+        if budget > 0 and secondary:
+            n = len(secondary)
+            start = self._snapshot_rr_offset % n
+            take = min(budget, n)
+            picked = [secondary[(start + i) % n] for i in range(take)]
+            targets.extend(picked)
+            # Advance the offset past what we took so the next tick continues
+            # round the ring (bounded to n so it never overflows).
+            self._snapshot_rr_offset = (start + take) % n
+        # Dedupe (a camera could be both main and a thumbnail mid-promotion).
         seen: set[str] = set()
-        targets: list[str] = []
-        for cid in camera_ids:
-            if isinstance(cid, str) and cid and cid not in seen:
-                seen.add(cid)
-                targets.append(cid)
-            if len(targets) >= SNAPSHOT_MAX_CONCURRENT:
-                break
+        deduped = [c for c in targets if not (c in seen or seen.add(c))]
 
         await asyncio.gather(
-            *(self._capture_and_post(cid) for cid in targets)
+            *(self._capture_and_post(cid) for cid in deduped)
         )
 
     async def _capture_and_post(self, camera_id: str) -> None:

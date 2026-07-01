@@ -204,12 +204,16 @@ class LazyWaitApiClient:
         GET /integrations/home-assistant/camera/snapshot/requests (bearer-authed;
         the cloud resolves the branch from the token). Returns the cloud's
         response verbatim:
-          { "cameraIds": ["camera.front", ...] }  — capture ONLY these
+          {
+            "primary":   ["camera.main"],        — grid MAIN, capture every tick
+            "secondary": ["camera.thumb1", ...], — thumbnails, round-robin
+            "cameraIds": [...],                   — flat union (back-compat)
+          }
 
-        The dashboard registers a camera id while its live view is open; the
-        cloud aggregates the currently-viewed set for this branch and hands it
-        back so HA captures only what someone is actually watching (usually 1,
-        often 0). An empty list means nobody is watching → capture nothing.
+        The dashboard registers a camera id while its live view is open (the grid
+        marks the main camera primary, thumbnails secondary); the cloud aggregates
+        the currently-viewed set for this branch and hands it back so HA captures
+        only what someone is watching. Empty primary+secondary → capture nothing.
 
         Raises LazyWaitAuthError on 401 (token rotated); LazyWaitApiError else.
         """

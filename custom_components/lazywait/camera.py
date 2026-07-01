@@ -75,6 +75,11 @@ _LOGGER = logging.getLogger(__name__)
 # Cap the go2rtc handshake so a wedged go2rtc can't hang the poll loop.
 _HANDSHAKE_TIMEOUT_SECONDS = 15
 
+# Per-camera bound for the stream-source liveness probe (see
+# _gate_online_by_stream_source). Probes run concurrently, so this is the
+# wall-clock cap for gating ALL channels, not a per-channel serial cost.
+_STREAM_SOURCE_PROBE_TIMEOUT_SECONDS = 2
+
 # HA-bundled go2rtc (HA 2024.11+) binds its HTTP API on 11984 — the standalone
 # go2rtc default 1984 prefixed with "1" to avoid a port clash. An in-process
 # custom component reaches it DIRECTLY on loopback; there is NO HA proxy path
@@ -749,7 +754,59 @@ async def list_cameras(
             continue
         seen.add(cid)
         deduped.append(cam)
-    return deduped
+
+    # Liveness gate: a Hikvision NVR reports EVERY configured channel as a
+    # camera.* entity in state 'idle' — including empty/disconnected slots — so
+    # the naive "not unavailable" online check passes all of them (16 channels
+    # when only ~11 have a physical camera). Re-resolve `online` from whether the
+    # channel advertises a real stream source (empty NVR slots resolve to None),
+    # then DROP offline cameras so the picker/grid only ever shows live feeds.
+    if hass is not None:
+        deduped = await _gate_online_by_stream_source(hass, deduped)
+    return [c for c in deduped if c.get("online")]
+
+
+async def _gate_online_by_stream_source(
+    hass: Any, cameras: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Re-compute each camera's ``online`` from stream-source resolution.
+
+    For every camera, resolve its RTSP/stream source in-process. A live channel
+    resolves to a non-empty URL; an empty NVR slot resolves to ``None`` (or
+    raises), so we mark it offline. Probes run CONCURRENTLY (one ~2s bound each)
+    so gating all channels is a single ~2s wall-clock step, not N×2s. Best-effort
+    and never raises: any camera whose probe errors is left at its prior
+    ``online`` value so a probe outage can't blank a working picker.
+    """
+    try:
+        from homeassistant.components.camera import (  # type: ignore
+            async_get_stream_source,
+        )
+    except Exception as err:  # noqa: BLE001 - API absent → keep prior online flags
+        _LOGGER.debug("async_get_stream_source unavailable; skipping gate: %s", err)
+        return cameras
+
+    async def _probe(cam: dict[str, Any]) -> dict[str, Any]:
+        entity_id = cam.get("id")
+        if not isinstance(entity_id, str):
+            return cam
+        try:
+            async with asyncio.timeout(_STREAM_SOURCE_PROBE_TIMEOUT_SECONDS):
+                source = await async_get_stream_source(hass, entity_id)
+            online = bool(source)
+            if not online:
+                _LOGGER.info(
+                    "Camera %s has no stream source (empty NVR slot?) → offline",
+                    entity_id,
+                )
+            return {**cam, "online": online}
+        except Exception as err:  # noqa: BLE001 - probe failure ≠ dead camera
+            # Leave the prior online flag: a transient probe error must not hide a
+            # real camera. (A truly dead slot fails the flag on the next cycle.)
+            _LOGGER.debug("stream-source probe for %s errored (kept): %s", entity_id, err)
+            return cam
+
+    return await asyncio.gather(*(_probe(c) for c in cameras))
 
 
 def _extract_answer_sdp(payload: Any) -> str | None:
