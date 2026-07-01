@@ -27,10 +27,15 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30
 INTEGRATION_VERSION = "26.7.3"
 # ── Near-live camera snapshot loop ──────────────────────────────────────────
 # A SEPARATE lightweight loop (not the 30s poll) captures a JPEG for each camera
-# the dashboard is viewing NOW and posts it, giving a ~1 fps near-live view
-# without WebRTC. ~1s cadence to feel live; concurrency capped to the (usually
-# single) camera actually being watched so it can't hammer the NVR.
-SNAPSHOT_LOOP_INTERVAL_SECONDS = 1.0
+# the dashboard is viewing NOW and posts it, giving a near-live view without
+# WebRTC. Concurrency is capped to the (usually single) camera actually being
+# watched so it can't hammer the NVR.
+#
+# This is the TARGET wall-clock period, enforced by a fixed-rate scheduler
+# (sleep = max(0, period - work_time)) so cadence doesn't drift by the tick's
+# work time. 0.4s targets ~2.5 fps; the real ceiling is the NVR still-grab cost
+# (each tick pulls a fresh keyframe), so this is an upper bound, not a promise.
+SNAPSHOT_LOOP_INTERVAL_SECONDS = 0.4
 SNAPSHOT_MAX_CONCURRENT = 2
 # Event types the component can emit to the cloud. Mirrors the cloud's
 # discriminated union (absence | presence | device_state).

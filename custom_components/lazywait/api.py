@@ -27,6 +27,11 @@ import aiohttp
 
 _HA_PREFIX = "/integrations/home-assistant"
 
+# Bounded total timeout for a near-live snapshot upload. Kept short: at a
+# sub-second capture cadence a hung POST would otherwise stall that camera's
+# frame far longer than one tick. A dropped frame just retries next tick.
+_SNAPSHOT_UPLOAD_TIMEOUT_SECONDS = 3.0
+
 
 class LazyWaitApiError(Exception):
     """Base error for cloud API failures."""
@@ -234,7 +239,12 @@ class LazyWaitApiClient:
             "image": image_b64,
             "contentType": content_type,
         }
-        return await self._authed_request("POST", url, json=body)
+        # Bounded upload: at a sub-second cadence a hung POST must not stall a
+        # camera's frame indefinitely (unlike the capture side, which already has
+        # its own timeout). A dropped frame is fine — the next tick retries.
+        return await self._authed_request(
+            "POST", url, json=body, timeout=_SNAPSHOT_UPLOAD_TIMEOUT_SECONDS
+        )
 
     async def report_cameras(
         self, cameras: list[dict[str, Any]]
@@ -356,11 +366,19 @@ class LazyWaitApiClient:
         url: str,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         req_headers = headers if headers is not None else self._auth_headers()
+        # A per-request total timeout when the caller wants a bounded call (the
+        # near-live upload does); otherwise omit the kwarg entirely so the call
+        # inherits the shared session default (passing timeout=None would DISABLE
+        # the timeout instead of inheriting it).
+        extra: dict[str, Any] = {}
+        if timeout is not None:
+            extra["timeout"] = aiohttp.ClientTimeout(total=timeout)
         try:
             async with self._session.request(
-                method, url, json=json, headers=req_headers
+                method, url, json=json, headers=req_headers, **extra
             ) as resp:
                 if resp.status == 401:
                     # Token rotated/revoked on the cloud — surface a distinct

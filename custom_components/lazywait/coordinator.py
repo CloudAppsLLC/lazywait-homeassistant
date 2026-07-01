@@ -168,14 +168,22 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ``asyncio.CancelledError`` propagates, so unload can stop it cleanly.
         """
         while True:
+            # Fixed-rate scheduler: measure the tick's work and sleep only the
+            # REMAINDER of the target period, so cadence is wall-clock-steady
+            # instead of drifting by (work + period). A tick slower than the
+            # period yields to the loop briefly (sleep 0) and immediately runs
+            # the next one — the NVR still-grab, not this sleep, is the ceiling.
+            started = self.hass.loop.time()
             try:
                 await self._snapshot_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - loop must never die
                 _LOGGER.debug("snapshot loop tick errored (ignored): %s", err)
+            elapsed = self.hass.loop.time() - started
+            delay = max(0.0, SNAPSHOT_LOOP_INTERVAL_SECONDS - elapsed)
             try:
-                await asyncio.sleep(SNAPSHOT_LOOP_INTERVAL_SECONDS)
+                await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 raise
 

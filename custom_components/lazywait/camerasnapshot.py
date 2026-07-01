@@ -18,6 +18,7 @@ degrade to ``None`` so a single bad frame can never break the coordinator loop.
 from __future__ import annotations
 
 import base64
+import io
 import logging
 from typing import TYPE_CHECKING
 
@@ -28,9 +29,19 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Per-capture timeout. Snapshots must feel live (~1 fps), so a camera that can't
-# produce a frame quickly is skipped this tick rather than stalling the loop.
-_SNAPSHOT_TIMEOUT_SECONDS = 8
+# Per-capture timeout. Snapshots must feel live, so a camera that can't produce a
+# frame quickly is skipped this tick rather than stalling the loop. Lowered from
+# 8s → 3s: at a sub-second cadence, an 8s stall freezes a flaky camera's view for
+# up to 8s per attempt; 3s fails fast and lets the next tick retry.
+_SNAPSHOT_TIMEOUT_SECONDS = 3
+
+# Near-live downscale target. NVR channels are commonly 1080p/4MP (~100–500 KB
+# JPEG); a near-live check-in still doesn't need that. Re-encoding to ~720p at a
+# moderate quality cuts bytes ~5–10× → far smaller/faster uploads on BOTH hops
+# (HA→cloud and cloud→dashboard) and a smaller frame to decode on the client.
+# 720p is still comfortably enough for face detection/recognition.
+_SNAPSHOT_MAX_DIMENSION = 1280
+_SNAPSHOT_JPEG_QUALITY = 65
 
 
 async def capture_snapshot(
@@ -74,7 +85,44 @@ async def capture_snapshot(
         _LOGGER.debug("snapshot for %s returned no bytes; skipping", entity_id)
         return None
     content_type = getattr(image, "content_type", None) or "image/jpeg"
+
+    # Downscale + re-encode for near-live BEFORE upload. Runs in an executor so
+    # the Pillow decode/encode never blocks the event loop. Best-effort: if
+    # Pillow is missing or the frame won't decode, fall back to the native bytes
+    # (a bigger-but-correct frame beats a dropped one).
+    try:
+        shrunk = await hass.async_add_executor_job(_downscale_jpeg, content)
+    except Exception as err:  # noqa: BLE001 - never break the loop on re-encode
+        _LOGGER.debug("snapshot re-encode failed for %s (using native): %s", entity_id, err)
+        shrunk = None
+    if shrunk is not None:
+        return shrunk, "image/jpeg"
     return content, content_type
+
+
+def _downscale_jpeg(content: bytes) -> bytes | None:
+    """Re-encode a JPEG down to ``_SNAPSHOT_MAX_DIMENSION`` at a near-live
+    quality. Returns the smaller JPEG, or ``None`` if Pillow is unavailable or
+    the frame won't decode (caller then uses the native bytes). Pure-CPU, meant
+    to run in an executor — never on the event loop."""
+    try:
+        from PIL import Image  # type: ignore  # noqa: PLC0415 - optional dep
+    except Exception:  # noqa: BLE001 - Pillow not installed → keep native frame
+        return None
+    try:
+        with Image.open(io.BytesIO(content)) as img:
+            img = img.convert("RGB")
+            longest = max(img.width, img.height)
+            # Only shrink; never upscale a smaller source.
+            if longest > _SNAPSHOT_MAX_DIMENSION:
+                scale = _SNAPSHOT_MAX_DIMENSION / longest
+                new_size = (round(img.width * scale), round(img.height * scale))
+                img = img.resize(new_size, Image.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=_SNAPSHOT_JPEG_QUALITY, optimize=True)
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - undecodable/odd frame → keep native
+        return None
 
 
 def encode_snapshot(content: bytes) -> str:
