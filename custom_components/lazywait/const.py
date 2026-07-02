@@ -23,8 +23,9 @@ CONF_PAIRING_CODE = "pairing_code"
 # the first successful config fetch.
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 
-# Identifies this component build to the cloud /status heartbeat.
-INTEGRATION_VERSION = "26.7.8"
+# Identifies this component build to the cloud /status heartbeat. The cloud
+# gates the Smart Branch telemetry feature on >= 26.8.0 (telemetrySupport.ts).
+INTEGRATION_VERSION = "26.8.0"
 # ── Near-live camera snapshot loop ──────────────────────────────────────────
 # A SEPARATE lightweight loop (not the 30s poll) captures a JPEG for each camera
 # the dashboard is viewing NOW and posts it, giving a near-live view without
@@ -43,10 +44,40 @@ SNAPSHOT_LOOP_INTERVAL_SECONDS = 0.4
 # still-grab, so this caps the load a cheap NVR sees.
 SNAPSHOT_MAX_CONCURRENT = 3
 # Event types the component can emit to the cloud. Mirrors the cloud's
-# discriminated union (absence | presence | device_state).
+# discriminated union (absence | presence | device_state | sensor_reading).
 EVENT_ABSENCE = "absence"
 EVENT_PRESENCE = "presence"
 EVENT_DEVICE_STATE = "device_state"
+EVENT_SENSOR_READING = "sensor_reading"
+
+# ── Smart Branch telemetry (spec §3.3, integration >= 26.8.0) ────────────────
+# The cloud /config ships monitored_entities + report_interval_seconds +
+# heartbeat_interval_seconds + significant_change; these are the local
+# defaults/floors used when an older cloud omits them (see telemetry.py).
+TELEMETRY_DEFAULT_REPORT_INTERVAL_SECONDS = 60
+TELEMETRY_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 300
+# Binary/non-numeric entities report ONLY state transitions, at most one per
+# entity per this window — raw per-flip streams never leave the branch (the
+# heartbeat reconciles the final state).
+TELEMETRY_BINARY_MIN_INTERVAL_SECONDS = 60
+# Events per POST /events batch. The cloud hard-caps the body at 500; 400
+# leaves headroom so a batch assembled at the cap never bounces.
+TELEMETRY_MAX_EVENTS_PER_BATCH = 400
+# Outbox ceiling during an extended cloud outage — oldest readings drop first
+# (mirrors the coordinator's absence-event buffer cap).
+TELEMETRY_MAX_BUFFERED_EVENTS = 1000
+# After a significant change wakes the flush loop, wait this long so
+# co-occurring changes (temp + humidity in the same second) share one batch.
+TELEMETRY_WAKE_COALESCE_SECONDS = 1.0
+# The ONLY attributes a sensor_reading ships. Deliberately tighter than the
+# admin-snapshot allowlist: these strings enter LLM contexts cloud-side
+# (spec §6.1), so nothing that could carry a secret or an injection surface
+# beyond a display name crosses the wire.
+TELEMETRY_ATTRIBUTE_ALLOWLIST: set[str] = {
+    "friendly_name",
+    "device_class",
+    "unit_of_measurement",
+}
 
 # ── Admin control: persistent outbound WebSocket ────────────────────────────
 # HA opens ONE persistent outbound WebSocket to the cloud for near-instant

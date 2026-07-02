@@ -73,6 +73,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # unload inside shutdown_admin_socket alongside the admin socket.
     coordinator.start_snapshot_loop()
 
+    # Start the Smart Branch telemetry flush loop (>= 26.8.0): batches
+    # sensor_reading events for the cloud-curated monitored entities on its own
+    # report-interval cadence (with early flush on significant changes). The
+    # first /config refresh above already applied the monitored set. Isolated +
+    # best-effort; stopped on unload inside shutdown_admin_socket.
+    coordinator.start_telemetry()
+
     # Store the coordinator directly (unchanged contract for sensor /
     # binary_sensor / hikvision platforms).
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator

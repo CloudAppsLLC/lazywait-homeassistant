@@ -147,6 +147,10 @@ _load("custom_components.lazywait.camerasnapshot", "camerasnapshot.py")
 _load("custom_components.lazywait.control", "control.py")
 _load("custom_components.lazywait.automations", "automations.py")
 _load("custom_components.lazywait.ws_client", "ws_client.py")
+# telemetry.py imports only stubbed homeassistant symbols at module level
+# (homeassistant.helpers.event is imported lazily inside _resubscribe), so the
+# pure decision logic (config parsing / buffer / batching) tests load HA-free.
+_load("custom_components.lazywait.telemetry", "telemetry.py")
 
 
 # ── Shared fakes (unit-level stand-ins for hass + the admin WS) ──────────────

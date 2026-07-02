@@ -335,6 +335,12 @@ class LazyWaitAdminSocket:
                         "inventory": True,
                         "services_catalog": True,
                         "scripts": True,
+                        # 26.8.0+: Smart Branch telemetry — sensor_reading
+                        # batches for the curated monitored_entities set. The
+                        # cloud's authoritative gate is integrationVersion
+                        # (telemetrySupport.ts); this flag mirrors it for
+                        # capability-based consumers.
+                        "telemetry": True,
                     },
                 }
             )

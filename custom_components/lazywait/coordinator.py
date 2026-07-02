@@ -41,6 +41,7 @@ from .const import (
 )
 from .mediarelay import MediaRelayManager
 from .camerai import CameraAiManager
+from .telemetry import TelemetrySender
 
 if TYPE_CHECKING:
     from .ws_client import LazyWaitAdminSocket
@@ -131,6 +132,13 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # with more thumbnails than the per-tick concurrency budget still refreshes
         # every channel over successive ticks instead of starving the tail.
         self._snapshot_rr_offset = 0
+        # Smart Branch telemetry (spec §3.3, >= 26.8.0): subscribes to
+        # state_changed for the cloud-curated monitored_entities set and POSTs
+        # batched sensor_reading events to /events on its own report-interval
+        # cadence. Config applied each /config poll; flush loop started in
+        # async_setup_entry, stopped on unload. Best-effort — never breaks the
+        # poll loop.
+        self._telemetry = TelemetrySender(hass, client, branch_id)
 
     def attach_admin_socket(
         self, socket: LazyWaitAdminSocket, task: asyncio.Task
@@ -153,6 +161,16 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # INFO (not debug) so the HA log CONFIRMS the near-live loop started —
         # its absence in the log means setup never reached here.
         _LOGGER.info("LazyWait near-live snapshot loop started (branch %s)", self._branch_id)
+
+    def start_telemetry(self) -> None:
+        """Start the telemetry flush loop (called from async_setup_entry).
+
+        Its own task on its own cadence (report_interval, default 60s — NOT
+        the 30s poll): the loop must also wake EARLY on a significant change,
+        which the fixed poll cycle can't do. Idles cheaply while the cloud
+        curates no monitored entities. Stopped in shutdown_admin_socket.
+        """
+        self._telemetry.start()
 
     async def shutdown_admin_socket(self) -> None:
         """Stop the admin socket task + snapshot loop + media-relay pushers (unload)."""
@@ -178,6 +196,8 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._media_relay.stop_all()
         # Tear down any running inference subprocesses too.
         await self._camera_ai.stop_all()
+        # Stop the telemetry flush loop + its state_changed listener.
+        await self._telemetry.stop()
 
     async def _snapshot_loop(self) -> None:
         """Near-live snapshot loop: poll viewed cameras, capture+post, ~1 fps.
@@ -354,6 +374,13 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 interval = config.get("pollIntervalSeconds")
                 if isinstance(interval, int) and interval > 0:
                     self.update_interval = timedelta(seconds=interval)
+
+            # Smart Branch telemetry: adopt monitored_entities + cadence +
+            # significant-change hints from this config (never raises; an
+            # older cloud without the fields yields an idle telemetry set).
+            # The re-subscribe only happens when the monitored SET changed,
+            # so the usual unchanged poll is a cheap no-op.
+            self._telemetry.apply_config(config)
 
             await self._flush_events()
 
