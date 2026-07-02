@@ -176,7 +176,40 @@ class Engine:
             tracks = state.assign(persons, now)
             poses = self._infer.pose(frame) if want_actions else []
             for tr in tracks:
-                # human_present heartbeat per track (deduped by cooldown).
+                bbox_norm = _norm_bbox(tr.bbox, frame)
+                # Compute this track's actions THIS frame (for the label).
+                primary_action = "standing"
+                acts: list[str] = []
+                if want_actions and poses:
+                    pose = _nearest_pose(tr.bbox, poses)
+                    if pose:
+                        bbox_wh = (tr.bbox[2], tr.bbox[3])
+                        acts = classify_single_frame(pose, bbox_wh)
+                        acts += classify_temporal(tr.hist, _center(tr.bbox), pose, bbox_wh)
+                        # Pick the most salient action for the on-screen label
+                        # (fall > raising_hand/waving > walking > sitting > standing).
+                        for pref in ("falling", "raising_hand", "waving", "walking", "sitting", "standing"):
+                            if pref in acts:
+                                primary_action = pref
+                                break
+
+                # track_update — EVERY frame, for the smooth live overlay (bbox +
+                # current action + stable track_id → the dashboard draws a colored
+                # box per person). Not stored long-term server-side (the ingest
+                # treats it as ephemeral); the throttled events below are the
+                # durable analytics record.
+                events.append(
+                    {
+                        "camera_id": cid,
+                        "area_id": area_id,
+                        "event_class": "track_update",
+                        "track_id": str(tr.id),
+                        "bbox": bbox_norm,
+                        "meta": {"action": primary_action},
+                    }
+                )
+
+                # human_present heartbeat per track (deduped) — durable presence.
                 if now - tr.last_emit >= _ACTION_COOLDOWN_S:
                     tr.last_emit = now
                     events.append(
@@ -185,17 +218,11 @@ class Engine:
                             "area_id": area_id,
                             "event_class": "human_present",
                             "track_id": str(tr.id),
-                            "bbox": _norm_bbox(tr.bbox, frame),
+                            "bbox": bbox_norm,
                         }
                     )
-                if not want_actions or not poses:
-                    continue
-                pose = _nearest_pose(tr.bbox, poses)
-                if not pose:
-                    continue
-                bbox_wh = (tr.bbox[2], tr.bbox[3])
-                acts = classify_single_frame(pose, bbox_wh)
-                acts += classify_temporal(tr.hist, _center(tr.bbox), pose, bbox_wh)
+
+                # Durable action/alert events (throttled state-changes).
                 for act in acts:
                     if act not in want_actions and not (act == "falling" and "falling" in want_actions):
                         continue
@@ -206,7 +233,7 @@ class Engine:
                                 "area_id": area_id,
                                 "event_class": "alert_fall",
                                 "track_id": str(tr.id),
-                                "bbox": _norm_bbox(tr.bbox, frame),
+                                "bbox": bbox_norm,
                             }
                         )
                         tr.last_actions[act] = now
@@ -220,7 +247,7 @@ class Engine:
                                 "area_id": area_id,
                                 "event_class": f"action_{act}",
                                 "track_id": str(tr.id),
-                                "bbox": _norm_bbox(tr.bbox, frame),
+                                "bbox": bbox_norm,
                             }
                         )
 
