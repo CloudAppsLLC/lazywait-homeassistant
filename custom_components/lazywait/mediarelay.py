@@ -96,6 +96,7 @@ class _Pusher:
         camera_id: str,
         stream_id: str,
         srt_host: str,
+        stream_quality: str = "auto",
     ) -> None:
         self.camera_id = camera_id
         # The COMPLETE MediaMTX streamid the cloud composed — used verbatim as
@@ -104,6 +105,8 @@ class _Pusher:
         self.stream_id = stream_id
         # `host:port` as a single string (cloud ships env.media.srtHost inline).
         self.srt_host = srt_host
+        # auto|low|high — picks the NVR sub- vs main-stream (see _apply_quality).
+        self.stream_quality = stream_quality or "auto"
         self._proc: asyncio.subprocess.Process | None = None
         self._rtsp: str | None = None
         # Monotonic timestamp of the last spawn; gates the restart floor.
@@ -117,7 +120,7 @@ class _Pusher:
         """True while the ffmpeg subprocess is alive (returncode still None)."""
         return self._proc is not None and self._proc.returncode is None
 
-    def desired_key(self) -> tuple[str, str, str]:
+    def desired_key(self) -> tuple[str, str, str, str]:
         """Identity used to detect config drift (a change → restart).
 
         If the cloud rotates the token (embedded in streamId), moves the SRT
@@ -129,6 +132,7 @@ class _Pusher:
             self.camera_id,
             self.stream_id,
             self.srt_host,
+            self.stream_quality,
         )
 
     def _build_srt_url(self) -> str:
@@ -182,6 +186,7 @@ class _Pusher:
                 "media relay: no RTSP source for %s; skipping push", self.camera_id
             )
             return False
+        rtsp_url = _apply_stream_quality(rtsp_url, self.stream_quality)
         self._rtsp = rtsp_url
 
         args = self._build_ffmpeg_args(rtsp_url)
@@ -374,6 +379,32 @@ async def _resolve_rtsp_source(hass: Any, camera_id: str) -> str | None:
     return None
 
 
+import re as _re
+
+# Hikvision RTSP stream path: /Streaming/Channels/<N>0<S> where S=1 is the main
+# stream and S=2 the sub-stream. We flip only the trailing stream digit so the
+# add-on can relay a lighter feed WITHOUT transcoding (zero CPU). Guarded to this
+# exact pattern → a no-op on any other NVR/URL shape (safe across the fleet).
+_HIK_CHANNEL_RE = _re.compile(r"(/Streaming/Channels/\d+0)([12])(\b|$|/|\?)", _re.IGNORECASE)
+
+
+def _apply_stream_quality(rtsp_url: str, quality: str) -> str:
+    """Rewrite a Hikvision RTSP URL's stream digit for low/high quality.
+
+    quality 'low'  → sub-stream  (…0*2*)  — smaller, smoother, faster to start.
+    quality 'high' → main-stream (…0*1*)  — sharper.
+    quality 'auto'/anything else → unchanged (use whatever HA resolved).
+    No-op if the URL isn't the Hikvision channel shape.
+    """
+    if quality not in ("low", "high"):
+        return rtsp_url
+    want = "2" if quality == "low" else "1"
+    m = _HIK_CHANNEL_RE.search(rtsp_url)
+    if not m:
+        return rtsp_url
+    return _HIK_CHANNEL_RE.sub(rf"\g<1>{want}\g<3>", rtsp_url, count=1)
+
+
 def _parse_media_relay_config(
     media_relay: Any,
 ) -> tuple[str, list[dict[str, str]]]:
@@ -415,10 +446,12 @@ def _parse_media_relay_config(
         ):
             _LOGGER.debug("media relay: dropping malformed camera entry: %s", item)
             continue
+        quality = item.get("streamQuality")
         cameras.append(
             {
                 "cameraId": camera_id.strip(),
                 "streamId": stream_id.strip(),
+                "streamQuality": quality.strip() if isinstance(quality, str) else "auto",
             }
         )
 
@@ -506,6 +539,7 @@ class MediaRelayManager:
                 camera_id=s["cameraId"],
                 stream_id=s["streamId"],
                 srt_host=srt_host,
+                stream_quality=s.get("streamQuality", "auto"),
             )
 
         # 1) Stop pushers no longer desired, or whose config drifted.
