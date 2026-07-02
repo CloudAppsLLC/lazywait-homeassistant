@@ -1,0 +1,8 @@
+# Edge inference deps for the Raspberry Pi (aarch64). Kept minimal + wheels-only
+# so the add-on image build stays fast and small. onnxruntime provides CPU
+# inference (and picks up a Hailo/Coral EP if the accelerator's runtime is also
+# installed on the host). opencv-python-headless for RTSP frame grab + resize.
+# numpy is a transitive dep but pinned for wheel availability on aarch64.
+onnxruntime==1.19.2
+opencv-python-headless==4.10.0.84
+numpy==1.26.4

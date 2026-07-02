@@ -40,6 +40,7 @@ from .const import (
     SNAPSHOT_MAX_CONCURRENT,
 )
 from .mediarelay import MediaRelayManager
+from .camerai import CameraAiManager
 
 if TYPE_CHECKING:
     from .ws_client import LazyWaitAdminSocket
@@ -116,6 +117,11 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # push SRT to the cloud MediaMTX. Driven entirely by config.media_relay;
         # reconciled each cycle. Best-effort — never breaks the poll loop.
         self._media_relay = MediaRelayManager(hass)
+        # Branch-side EDGE inference: one YOLO detection/pose subprocess per
+        # AI-enabled camera (deps live in the add-on image). Driven by
+        # config.cameraAi; reconciled each cycle. Best-effort — never breaks the
+        # poll loop. See camerai.py.
+        self._camera_ai = CameraAiManager(hass)
         # Near-live snapshot loop: a SEPARATE ~1s asyncio task (the 30s poll is
         # far too slow to feel live). It polls which cameras the dashboard is
         # viewing now and captures+posts a JPEG for each. Started in
@@ -170,6 +176,8 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._snapshot_task = None
         # Tear down any running ffmpeg SRT pushers so they don't outlive the entry.
         await self._media_relay.stop_all()
+        # Tear down any running inference subprocesses too.
+        await self._camera_ai.stop_all()
 
     async def _snapshot_loop(self) -> None:
         """Near-live snapshot loop: poll viewed cameras, capture+post, ~1 fps.
@@ -227,6 +235,15 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if not isinstance(resp, dict):
             return
+
+        # Fast-path media relay: the cloud now ships the `mediaRelay` directive on
+        # THIS ~0.4s poll (as well as the 30s /config poll), so a freshly-selected
+        # camera's SRT push starts within ~1s instead of waiting up to 30s for the
+        # next config cycle. reconcile is idempotent + cheap when unchanged and
+        # never raises, so it's safe to call every tick. When the cloud omits the
+        # block (older cloud), this is a no-op and the 30s /config path still drives it.
+        if "mediaRelay" in resp:
+            await self._media_relay.reconcile(resp.get("mediaRelay"))
 
         # The cloud splits viewed cameras into `primary` (the grid MAIN — capture
         # every tick so it stays fast) and `secondary` (thumbnail tiles — fine to
@@ -368,6 +385,13 @@ class LazyWaitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Cloud ships the block under camelCase `mediaRelay` (the exact key
             # HaConfigService.getConfig sets); read that, not snake_case.
             await self._media_relay.reconcile(config.get("mediaRelay"))
+
+            # Branch-side EDGE inference: converge the per-camera YOLO detection
+            # subprocesses onto the cloud's `cameraAi` directive (which cameras,
+            # actions, objects, fps). Reconciled on the 30s /config cycle only
+            # (inference is NOT view-gated like the media relay — it runs whenever
+            # a camera is AI-enabled). Best-effort + isolated; never fails the cycle.
+            await self._camera_ai.reconcile(config.get("cameraAi"))
 
             return config
         except LazyWaitAuthError as err:

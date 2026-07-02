@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lazywait_inference"
+version = "0.1.0"
+description = "LazyWait edge camera-AI inference (runs on the branch Raspberry Pi)"
+requires-python = ">=3.9"
+# Runtime deps are installed separately in the add-on image (musl-friendly index)
+# so the image can proceed even if a wheel is unavailable for the arch; declaring
+# them here too keeps a plain `pip install .` self-contained for dev.
+dependencies = [
+    "onnxruntime>=1.17",
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+]
+
+[tool.setuptools.packages.find]
+include = ["lazywait_inference*"]
