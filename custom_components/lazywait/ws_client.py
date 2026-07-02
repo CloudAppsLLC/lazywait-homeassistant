@@ -5,7 +5,13 @@ opens ONE long-lived WebSocket to the cloud, authenticated by the SAME
 enrollment bearer the HTTP path uses, and:
 
   * sends a ``hello`` frame (branch + versions + capabilities) on connect,
-  * pushes a full ``state_snapshot`` of the branch's entities on connect,
+  * pushes the full inventory on connect (and again on ``resync_request``):
+    ``state_snapshot`` (paged when huge) → ``registry_snapshot`` (areas +
+    devices) → ``services_catalog`` (callable domain/service names),
+  * re-pushes ``state_snapshot`` + ``registry_snapshot`` every 60s
+    (ADMIN_STATE_FULL_PUSH_SECONDS) so a cloud restart self-heals,
+  * pushes debounced ``full:false`` state deltas from an EVENT_STATE_CHANGED
+    listener (2s batches) so the dashboard tracks live state between pushes,
   * receives ``command`` frames, executes them in-process (control.py /
     automations.py), and posts a ``command_result`` back on the same socket,
   * answers the cloud's WS-level pings (aiohttp ``heartbeat``) to keep the
@@ -16,6 +22,9 @@ async_unload_entry. It NEVER raises out of the task (an unraised exception in a
 bare task is swallowed by asyncio and would silently kill control) — a 401 at
 the upgrade handshake explicitly kicks off HA's reauth instead of a tight
 reconnect storm; any other drop reconnects with exponential backoff + jitter.
+The per-connection push helpers (periodic task, state listener, delta flusher)
+are torn down on every socket close/stop/reconnect — no leaks, no duplicate
+listeners across reconnects.
 """
 
 from __future__ import annotations
@@ -29,10 +38,13 @@ from typing import Any
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import HomeAssistant, callback
 
 from .api import LazyWaitApiClient
 from .const import (
+    ADMIN_STATE_DELTA_DEBOUNCE_SECONDS,
+    ADMIN_STATE_FULL_PUSH_SECONDS,
     ADMIN_WS_BACKOFF_CAP_SECONDS,
     ADMIN_WS_BACKOFF_START_SECONDS,
     ADMIN_WS_PATH,
@@ -48,7 +60,7 @@ def _json_default(obj: Any) -> Any:
     HA entity attributes + automation configs carry datetime/date/time objects
     (e.g. automation `last_triggered`, sensor timestamps). Plain json.dumps raises
     'Object of type datetime is not JSON serializable', which was crashing the
-    admin WS on EVERY connect at _send_full_snapshot → the control socket never
+    admin WS on EVERY connect at _send_state_snapshot → the control socket never
     stayed up. Serialize temporal types as ISO strings and anything else as its
     string form so a stray unexpected type can never take the socket down."""
     if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
@@ -90,6 +102,16 @@ class LazyWaitAdminSocket:
         self._branch_id = branch_id
         self._stopped = False
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        # Per-connection push helpers — created in _start_push_helpers after a
+        # successful connect, torn down in _stop_push_helpers on EVERY exit
+        # path (close/error/stop/reconnect) so listeners never stack up.
+        self._periodic_task: asyncio.Task | None = None
+        self._delta_flush_task: asyncio.Task | None = None
+        self._unsub_state_changed: Any | None = None
+        self._pending_deltas: set[str] = set()
+        # async_get_all_descriptions loads every integration's services.yaml
+        # (slow) — cache the map per connection; it's static enough for one.
+        self._service_descriptions: dict[str, Any] | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -143,8 +165,9 @@ class LazyWaitAdminSocket:
             backoff = min(backoff * 2, ADMIN_WS_BACKOFF_CAP_SECONDS)
 
     async def stop(self) -> None:
-        """Signal the loop to stop and close the socket."""
+        """Signal the loop to stop, tear down push helpers, close the socket."""
         self._stopped = True
+        self._stop_push_helpers()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
 
@@ -152,23 +175,138 @@ class LazyWaitAdminSocket:
         url = self._client.ws_url(ADMIN_WS_PATH)
         headers = self._client.auth_headers()
         _LOGGER.info("Admin WS connecting to %s", url)
+        # The services-description cache is per-connection.
+        self._service_descriptions = None
         async with self._client.session.ws_connect(
             url, headers=headers, heartbeat=_WS_HEARTBEAT
         ) as ws:
             self._ws = ws
-            _LOGGER.info("Admin WS connected (branch %s)", self._branch_id)
-            await self._send_hello(ws)
-            await self._send_full_snapshot(ws)
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    await self._handle_text(ws, msg.data)
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
-                    if ws.close_code == _CLOSE_BRANCH_MISMATCH:
-                        raise _BranchMismatch()
-                    break
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    break
-            self._ws = None
+            try:
+                _LOGGER.info("Admin WS connected (branch %s)", self._branch_id)
+                await self._send_hello(ws)
+                await self._send_inventory(ws)
+                self._start_push_helpers(ws)
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        await self._handle_text(ws, msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
+                        if ws.close_code == _CLOSE_BRANCH_MISMATCH:
+                            raise _BranchMismatch()
+                        break
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        break
+            finally:
+                # EVERY exit path (clean close, error, cancel) tears the
+                # helpers down — a reconnect must never stack a second
+                # state-changed listener or periodic task.
+                self._stop_push_helpers()
+                self._ws = None
+
+    # ── Per-connection push helpers ──────────────────────────────────────────
+
+    def _start_push_helpers(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Start the periodic full-push task + the state-changed listener."""
+        self._stop_push_helpers()  # belt-and-suspenders against double-start
+        self._unsub_state_changed = self._hass.bus.async_listen(
+            EVENT_STATE_CHANGED, self._on_state_changed
+        )
+        self._periodic_task = asyncio.create_task(self._periodic_full_push(ws))
+
+    def _stop_push_helpers(self) -> None:
+        """Unsubscribe + cancel everything started for the current socket."""
+        if self._unsub_state_changed is not None:
+            try:
+                self._unsub_state_changed()
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                pass
+            self._unsub_state_changed = None
+        for attr in ("_periodic_task", "_delta_flush_task"):
+            task: asyncio.Task | None = getattr(self, attr)
+            if task is not None and not task.done():
+                task.cancel()
+            setattr(self, attr, None)
+        self._pending_deltas.clear()
+
+    @callback
+    def _on_state_changed(self, event: Any) -> None:
+        """EVENT_STATE_CHANGED bus listener — accumulate, flush after the
+        debounce window. The first event of a burst schedules the flush;
+        later events just join the batch (a fixed trailing window, NOT a
+        resetting timer, so a chatty mesh can't starve the flush forever)."""
+        data = getattr(event, "data", None)
+        entity_id = data.get("entity_id") if isinstance(data, dict) else None
+        if not entity_id:
+            return
+        self._pending_deltas.add(entity_id)
+        if self._delta_flush_task is None or self._delta_flush_task.done():
+            self._delta_flush_task = asyncio.create_task(self._flush_deltas())
+
+    async def _flush_deltas(self) -> None:
+        """Sleep out the debounce window, then ship the batch as `full:false`
+        state_snapshot frames — PAGED through the same helper as the full
+        snapshot, because a bulk update (integration reload, template-sensor
+        recalc) can dirty more entities than fit one WS frame. Loops while new
+        changes landed during a send, so nothing waits for the 60s full push.
+        Never raises (a failed delta is healed by the 60s full push)."""
+        from . import control  # noqa: PLC0415 - lazy: avoid circular import via __init__
+
+        try:
+            while True:
+                await asyncio.sleep(ADMIN_STATE_DELTA_DEBOUNCE_SECONDS)
+                pending, self._pending_deltas = self._pending_deltas, set()
+                ws = self._ws
+                if not pending or ws is None or ws.closed:
+                    return
+                entities = control.build_state_snapshot(
+                    self._hass, only_entity_ids=pending
+                )
+                if entities:
+                    # Deltas always merge (full:false on every page); page/pages
+                    # are informational — the cloud merges by entity_id.
+                    for page in control.page_state_snapshot(entities):
+                        await ws.send_str(
+                            _dumps(
+                                {
+                                    "v": 1,
+                                    "type": "state_snapshot",
+                                    "branchId": self._branch_id,
+                                    "full": False,
+                                    "page": 1,
+                                    "pages": 1,
+                                    "entities": page,
+                                }
+                            )
+                        )
+                # Changes that arrived while we were sending are in the fresh
+                # set — flush them next window instead of stranding them until
+                # the periodic push. (Events land in _pending_deltas during our
+                # awaits; the emptiness check and return are one synchronous
+                # step, so nothing can slip in after it.)
+                if not self._pending_deltas:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - must never kill the loop
+            _LOGGER.debug("Admin WS delta push failed: %s", err)
+
+    async def _periodic_full_push(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        """Every ADMIN_STATE_FULL_PUSH_SECONDS re-push state + registry so the
+        cloud cache self-heals after an apiv2 restart or a missed delta."""
+        try:
+            while not ws.closed:
+                await asyncio.sleep(ADMIN_STATE_FULL_PUSH_SECONDS)
+                if ws.closed:
+                    return
+                await self._send_state_snapshot(ws)
+                await self._send_registry_snapshot(ws)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - must never kill the loop
+            # A send on a closing socket lands here; the run loop owns the
+            # reconnect, this task just bows out.
+            _LOGGER.debug("Admin WS periodic push stopped: %s", err)
 
     async def _send_hello(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         # Report whether create/edit is possible (split config disables it).
@@ -192,25 +330,87 @@ class LazyWaitAdminSocket:
                         "automation_control": True,
                         "automation_write": not split,
                         "split_config": split,
+                        # 26.7.8+: full inventory (all domains + registry
+                        # frames), services catalog, and script triggering.
+                        "inventory": True,
+                        "services_catalog": True,
+                        "scripts": True,
                     },
                 }
             )
         )
 
-    async def _send_full_snapshot(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+    async def _send_inventory(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """The full inventory push: state → registry → services (contract order)."""
+        await self._send_state_snapshot(ws)
+        await self._send_registry_snapshot(ws)
+        await self._send_services_catalog(ws)
+
+    async def _send_state_snapshot(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         from . import control  # noqa: PLC0415 - lazy: avoid circular import via __init__
 
         entities = control.build_state_snapshot(self._hass)
+        pages = control.page_state_snapshot(entities)
+        total = len(pages)
+        for idx, page in enumerate(pages, start=1):
+            await ws.send_str(
+                _dumps(
+                    {
+                        "v": 1,
+                        "type": "state_snapshot",
+                        "branchId": self._branch_id,
+                        # Page 1 `full:true` resets the cloud cache; pages 2+
+                        # `full:false` merge in (the cloud's merge semantics
+                        # make paging correct).
+                        "full": idx == 1,
+                        "page": idx,
+                        "pages": total,
+                        "entities": page,
+                    }
+                )
+            )
+
+    async def _send_registry_snapshot(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        from . import control  # noqa: PLC0415 - lazy: avoid circular import via __init__
+
+        registry = control.build_registry_snapshot(self._hass)
         await ws.send_str(
             _dumps(
                 {
                     "v": 1,
-                    "type": "state_snapshot",
+                    "type": "registry_snapshot",
                     "branchId": self._branch_id,
-                    "full": True,
-                    "page": 1,
-                    "pages": 1,
-                    "entities": entities,
+                    "areas": registry["areas"],
+                    "devices": registry["devices"],
+                }
+            )
+        )
+
+    async def _send_services_catalog(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        from . import control  # noqa: PLC0415 - lazy: avoid circular import via __init__
+
+        if self._service_descriptions is None:
+            try:
+                self._service_descriptions = await control.get_service_descriptions(
+                    self._hass
+                )
+            except Exception as err:  # noqa: BLE001 - names-only beats no catalog
+                _LOGGER.debug("service descriptions unavailable: %s", err)
+                self._service_descriptions = {}
+        domains = await control.build_services_catalog(
+            self._hass, self._service_descriptions
+        )
+        await ws.send_str(
+            _dumps(
+                {
+                    "v": 1,
+                    "type": "services_catalog",
+                    "branchId": self._branch_id,
+                    "domains": domains,
                 }
             )
         )
@@ -226,7 +426,8 @@ class LazyWaitAdminSocket:
         if ftype == "command":
             await self._handle_command(ws, frame)
         elif ftype == "resync_request":
-            await self._send_full_snapshot(ws)
+            # The cloud found its cache missing/stale — re-push everything.
+            await self._send_inventory(ws)
 
     async def _handle_command(
         self, ws: aiohttp.ClientWebSocketResponse, frame: dict[str, Any]

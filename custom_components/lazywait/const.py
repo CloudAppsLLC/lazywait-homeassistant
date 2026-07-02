@@ -24,7 +24,7 @@ CONF_PAIRING_CODE = "pairing_code"
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 
 # Identifies this component build to the cloud /status heartbeat.
-INTEGRATION_VERSION = "26.7.6"
+INTEGRATION_VERSION = "26.7.8"
 # ── Near-live camera snapshot loop ──────────────────────────────────────────
 # A SEPARATE lightweight loop (not the 30s poll) captures a JPEG for each camera
 # the dashboard is viewing NOW and posts it, giving a near-live view without
@@ -60,14 +60,44 @@ ADMIN_WS_PATH = "/integrations/home-assistant/admin/ws"
 ADMIN_WS_BACKOFF_START_SECONDS = 1
 ADMIN_WS_BACKOFF_CAP_SECONDS = 30
 
-# How often the WS client pushes a full state snapshot even absent a change
-# (a floor; deltas are pushed on change, debounced).
+# How often the WS client pushes a full state snapshot (+ registry snapshot)
+# even absent a change — the floor that heals the cloud cache after an apiv2
+# restart or a missed delta. Driven by the per-connection periodic task in
+# ws_client.py.
 ADMIN_STATE_FULL_PUSH_SECONDS = 60
 
+# State-changed deltas are batched and flushed this many seconds after the
+# first change in a burst (trailing batch, NOT a resetting timer — a busy
+# zigbee mesh must still flush every window instead of starving forever).
+ADMIN_STATE_DELTA_DEBOUNCE_SECONDS = 2
+
+# ── Snapshot size safety (mirror the cloud's haStateRegistryService caps) ───
+# A snapshot larger than this is split into pages: page 1 `full:true` (resets
+# the cloud cache), pages 2+ `full:false` (merged in) — one giant WS frame
+# would trip the cloud's per-message size limit (512 KB maxPayload). At the
+# observed ~340 bytes/entity (entity_id + generic attributes + two 32-hex
+# registry ids) 700 entities ≈ 240 KB — half the cap, so page 1's heavier
+# controllable entities still fit. Delta flushes page through the same helper.
+ADMIN_STATE_SNAPSHOT_PAGE_SIZE = 700
+# Hard entity ceiling per snapshot, trimmed AFTER controllable-first ordering
+# so the entities the dashboard can actually drive survive the cut.
+ADMIN_STATE_MAX_ENTITIES = 1900
+
+# ── Inventory frame caps (registry_snapshot / services_catalog) ─────────────
+# Trim, never fail: a monster install still gets a useful (partial) inventory.
+ADMIN_REGISTRY_MAX_AREAS = 200
+ADMIN_REGISTRY_MAX_DEVICES = 500
+ADMIN_REGISTRY_STRING_MAX_CHARS = 128
+ADMIN_SERVICES_MAX_DOMAINS = 150
+ADMIN_SERVICES_MAX_PER_DOMAIN = 100
+ADMIN_SERVICE_DESCRIPTION_MAX_CHARS = 140
+
 # ── Control allowlists (mirror the cloud's haCommandAllowlist.ts) ───────────
-# Positive allowlist of {domain: {services}} the cloud may drive. HA re-checks
-# this locally before async_call — a second independent gate so a widened cloud
-# allowlist still can't run a service HA didn't sanction.
+# Curated {domain: {services}} the cloud drives at its normal (write) tier.
+# Anything OUTSIDE this map but not hard-denied is still callable — the cloud
+# gates those behind its delete tier; HA cannot see tiers, so its own gate is
+# the HARD_DENY_DOMAINS backstop (see _service_allowed). This map also feeds
+# the `controllable` flag on state snapshots.
 DEVICE_CONTROL_ALLOWLIST: dict[str, set[str]] = {
     "light": {"turn_on", "turn_off", "toggle"},
     "switch": {"turn_on", "turn_off", "toggle"},
@@ -83,6 +113,11 @@ DEVICE_CONTROL_ALLOWLIST: dict[str, set[str]] = {
     # still allows them only via this explicit map (never a wildcard).
     "lock": {"lock", "unlock"},
     "alarm_control_panel": {"alarm_arm_home", "alarm_arm_away", "alarm_disarm"},
+    # Scripts/buttons run whatever the branch admin authored INSIDE HA — the
+    # cloud only pulls the trigger, so these sit at the normal write tier.
+    "script": {"turn_on", "turn_off", "toggle"},
+    "button": {"press"},
+    "input_button": {"press"},
 }
 
 # Automation ops the cloud may drive.
@@ -111,19 +146,13 @@ HARD_DENY_DOMAINS: set[str] = {
     "persistent_notification",
 }
 
-# Domains whose entities are reported to the cloud state cache (controllable +
-# read-only sensors useful as automation triggers). Anything else is omitted.
-REPORTED_DOMAINS: set[str] = set(DEVICE_CONTROL_ALLOWLIST.keys()) | {
-    "binary_sensor",
-    "sensor",
-    "automation",
-    "person",
-    "device_tracker",
-}
-
-# Per-domain attribute allowlist for the state snapshot. Raw HA attributes leak
-# camera stream creds / GPS / access tokens — only these are pushed to the
-# cloud. friendly_name is always included on top of the per-domain set.
+# ALL entity domains are reported to the cloud state cache (the old
+# REPORTED_DOMAINS whitelist is gone — the dashboard now renders the full
+# inventory). Safety moved from domain filtering to attribute filtering:
+# per-domain ATTRIBUTE_ALLOWLIST below, with GENERIC_ATTRIBUTES as the only
+# fallback for unlisted domains. Raw HA attributes leak camera stream creds /
+# GPS / access tokens — never ship them. friendly_name is always included on
+# top of the per-domain set.
 ATTRIBUTE_ALLOWLIST: dict[str, set[str]] = {
     "light": {"brightness", "color_temp", "rgb_color", "supported_color_modes"},
     "fan": {"percentage", "preset_mode"},
@@ -142,4 +171,14 @@ ATTRIBUTE_ALLOWLIST: dict[str, set[str]] = {
     "binary_sensor": {"device_class"},
     "alarm_control_panel": {"code_format"},
     "automation": {"last_triggered", "mode"},
+    "script": {"last_triggered", "mode"},
+}
+
+# The ONLY attributes shipped for domains without an ATTRIBUTE_ALLOWLIST entry.
+# Deliberately display-only metadata — nothing here can carry a secret.
+GENERIC_ATTRIBUTES: set[str] = {
+    "friendly_name",
+    "device_class",
+    "unit_of_measurement",
+    "icon",
 }
