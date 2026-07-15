@@ -25,7 +25,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30
 
 # Identifies this component build to the cloud /status heartbeat. The cloud
 # gates the Smart Branch telemetry feature on >= 26.8.0 (telemetrySupport.ts).
-INTEGRATION_VERSION = "26.8.0"
+INTEGRATION_VERSION = "26.7.24"
 # ── Near-live camera snapshot loop ──────────────────────────────────────────
 # A SEPARATE lightweight loop (not the 30s poll) captures a JPEG for each camera
 # the dashboard is viewing NOW and posts it, giving a near-live view without
